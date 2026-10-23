@@ -9,9 +9,11 @@ import { S } from './state'
 import { isSet } from './terminal'
 import { clockAfter, clockNow, envGet, fsRead, httpFetch, pluginRoot, sessionSurfaces, storeGet, storeSet, uiToast, type EnvName } from './api'
 
-// The manifest of the newest release (a release changes its `version`).
+// The manifest of upstream's newest release (a release changes its
+// `version`): in this fork, the check says that upstream has a release to
+// review, and the steps merge it here first.
 export const UPDATE_URL = 'https://raw.githubusercontent.com/razorback16/cc-intelligent-ui/main/.claude-plugin/plugin.json'
-export const MARKETPLACE = 'razorback16'
+export const MARKETPLACE = 'cc-intelligent-ui'
 export const PLUGIN_ID = `cc-intelligent-ui@${MARKETPLACE}`
 // One check in this time at most; the toast of one version as often.
 export const UPDATE_EVERY_MS = 24 * 60 * 60 * 1000
@@ -84,7 +86,7 @@ export function toldOf(value: unknown): Told | null {
 export const shouldTell = (told: Told | null, latest: string, now: number) =>
   !told || told.version !== latest || now - told.at >= UPDATE_EVERY_MS || now < told.at
 
-export const UPDATE_STEPS = `claude plugin marketplace update ${MARKETPLACE}, then claude plugin update ${PLUGIN_ID}, then /reload-plugins`
+export const UPDATE_STEPS = `git fetch upstream in your fork, review and merge it, push, then claude plugin marketplace update ${MARKETPLACE}, then claude plugin update ${PLUGIN_ID}, then /reload-plugins`
 export const updateToast = (latest: string, own: string) =>
   `Intelligent UI ${latest} is available (you have ${own}): run ${UPDATE_STEPS}`
 

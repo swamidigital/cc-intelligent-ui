@@ -1,5 +1,5 @@
 {
-  "name": "razorback16",
+  "name": "cc-intelligent-ui",
   "owner": { "name": "razorback16" },
   "metadata": {
     "description": "Intelligent UI: Claude's answers drawn as rendered Markdown in your terminal"

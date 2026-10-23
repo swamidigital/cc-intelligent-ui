@@ -67,8 +67,8 @@ test('a check is due 24 h after the last one; a version is told once a day', () 
 
 test('the toast, the details line and the /iui notice', () => {
   expect(updateToast('0.3.0', '0.2.0')).toBe(
-    'Intelligent UI 0.3.0 is available (you have 0.2.0): run claude plugin marketplace update razorback16, then claude plugin update cc-intelligent-ui@razorback16, then /reload-plugins')
-  expect(UPDATE_STEPS).toBe('claude plugin marketplace update razorback16, then claude plugin update cc-intelligent-ui@razorback16, then /reload-plugins')
+    'Intelligent UI 0.3.0 is available (you have 0.2.0): run git fetch upstream in your fork, review and merge it, push, then claude plugin marketplace update cc-intelligent-ui, then claude plugin update cc-intelligent-ui@cc-intelligent-ui, then /reload-plugins')
+  expect(UPDATE_STEPS).toBe('git fetch upstream in your fork, review and merge it, push, then claude plugin marketplace update cc-intelligent-ui, then claude plugin update cc-intelligent-ui@cc-intelligent-ui, then /reload-plugins')
   const o = { on: true, off: '', own: '0.2.0', checked: { at: NOW - 3 * HOUR, latest: '0.3.0' }, now: NOW }
   expect(updateLine(o)).toBe('on, 0.3.0 is available (you have 0.2.0)')
   expect(updateLine({ ...o, checked: { at: NOW - 3 * HOUR, latest: '0.2.0' } })).toBe('on, up to date (0.2.0, checked 3 hours ago)')
