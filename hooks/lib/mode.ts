@@ -21,7 +21,7 @@ export function settingOf(value: unknown): ThemeSetting {
 // The OS appearance, and where it was read.
 export type HostMode = {
   mode: IuiTheme
-  source: 'terminal' | 'iTerm2' | 'Ghostty' | 'cmux' | 'kitty' | 'Rio' | 'macOS' | 'GNOME' | 'desktop portal' | 'COLORFGBG'
+  source: 'terminal' | 'herdr' | 'iTerm2' | 'Ghostty' | 'cmux' | 'kitty' | 'Rio' | 'macOS' | 'GNOME' | 'desktop portal' | 'COLORFGBG' | 'IUI_MODE'
   detail?: string
 }
 
@@ -60,6 +60,12 @@ export function modeOfColorFgBg(value: string | undefined): IuiTheme | null {
   return null
 }
 
+// IUI_MODE: light or dark; null for anything else.
+export const modeOfVar = (value: string | undefined): IuiTheme | null => {
+  const v = (value ?? '').trim().toLowerCase()
+  return v === 'light' || v === 'dark' ? v : null
+}
+
 // The mode to draw: a fixed setting as set; auto as the OS is, dark when it
 // was never read.
 export function resolveMode(setting: ThemeSetting, seen: HostMode | null): IuiTheme {
@@ -90,6 +96,23 @@ export function parseOsc11(text: string): Rgb | null {
   return { r: part(m[1]!), g: part(m[2]!), b: part(m[3]!) }
 }
 
+// Under herdr, the OSC 11 answer (the background of the terminal in front).
+// The probe reads the tty that Claude Code reads, so it runs only at the
+// start and for a new herdr client, at most OSC11_TRIES times (an answer
+// can go to Claude Code). `answer`: a probe's mode (undefined: no probe this
+// time); `base`: the mode of the other sources now. The answer stays while
+// those give the mode they gave when it came (null: not known, no change);
+// a change there (the OS, the terminal's config) wins.
+export const OSC11_TRIES = 3
+export type Osc11Kept = { seen: HostMode; base: IuiTheme | null } | null
+export function keptOsc11(last: Osc11Kept, base: HostMode | null, answer?: HostMode | null): { kept: Osc11Kept; use: HostMode | null } {
+  if (answer) return { kept: { seen: answer, base: base?.mode ?? null }, use: answer }
+  if (!last) return { kept: null, use: base }
+  if (!base) return { kept: last, use: last.seen }
+  if (last.base === null) return { kept: { seen: last.seen, base: base.mode }, use: last.seen }
+  return last.base === base.mode ? { kept: last, use: last.seen } : { kept: null, use: base }
+}
+
 // Control characters shown as text (\e, \a, \xNN), for /iui probe.
 export const escapeControls = (text: string) =>
-  text.replace(/[\x00-\x1f\x7f]/g, c => (c === '\x1b' ? '\\e' : c === '\x07' ? '\\a' : `\\x${c.charCodeAt(0).toString(16).padStart(2, '0')}`))
+  text.replace(/[\x00-\x1f\x7f]/g, c => (c.charCodeAt(0) === 27 ? '\\e' : c.charCodeAt(0) === 7 ? '\\a' : `\\x${c.charCodeAt(0).toString(16).padStart(2, '0')}`))

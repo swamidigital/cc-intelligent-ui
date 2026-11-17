@@ -2,6 +2,77 @@
 
 All releases of Intelligent UI for Claude Code (`cc-intelligent-ui`). Claude Code finds a new version by the `version` in `.claude-plugin/plugin.json`. To get it, refer to [Update](docs/install.md#update).
 
+## 0.3.5 (2026-11-03)
+
+### New
+
+- **Images that Claude reads.** When Claude opens a PNG, JPEG or WebP image with the Read tool, the image draws under the expanded Read row (ctrl+o, `--verbose`, or an unfolded group) as a small preview, as a pasted image does. The folded line (`Read 2 files`) stays as it is. Refer to [Images that Claude reads](docs/usage.md#images-that-claude-reads). ([#2](https://github.com/razorback16/cc-intelligent-ui/issues/2))
+- **`IUI_INLINE`.** `IUI_INLINE=1` sends pictures as data, as over ssh. `IUI_INLINE=0` makes the terminal read the files, also over ssh. Use it where the mod cannot see ssh, such as in a background session.
+- **`IUI_FONT` and `IUI_MODE`.** Over ssh, and with `herdr --remote`, the mod cannot read your terminal's font or background. Set `IUI_FONT` (the font family) and `IUI_MODE` (`light` or `dark`, for the `auto` theme) in the remote computer's shell start file to name them. The mod uses them only where it cannot read the terminal, and `/iui details` names them. Refer to [Terminals](docs/install.md#terminals).
+
+### Fixed
+
+- **Background sessions with `IUI_FORCE=1`.** A background session (`claude --bg`, `claude attach`) now shows pictures when `IUI_FORCE=1` and `CLAUDE_CODE_FORCE_TERMINAL_IMAGES=1` are set, also when the daemon started in tmux. Without both, answers stay text, because Claude Code draws no pictures there. Before, it never showed pictures. ([#2](https://github.com/razorback16/cc-intelligent-ui/issues/2))
+
+## 0.3.4 (2026-10-25)
+
+### New
+
+- **A click opens a link or a file.** With picture select, a plain click on a web link opens it in the browser (`open` on macOS, `xdg-open` on Linux). A plain click on a file path opens it in your editor, at the line and column of the path. With no editor (the system app), only pictures, PDFs and text or code files open (text and code with `open -t` on macOS). The mod copies the path of other files, such as a `.command`, `.app`, `.webloc` or `.desktop` file, because the system app can run them. A folder or a symbolic link is not a live path. Alt+click copies the link or path, as a click did before. A click on a command or a code block's copy button still copies, and a drag still selects text. If the open fails, the mod copies the target and the toast says so, but not over a newer copy that came while it tried to open. Over ssh, a click copies. In iTerm2, Option+click goes to the terminal's own selection, so alt+click may not reach the mod there. Refer to [Click a link, a file or a command](docs/usage.md#click-a-link-a-file-or-a-command).
+- **`/iui editor`.** Sets the editor for file paths. `auto` (the default) uses the first editor on the PATH: `code`, `code-insiders`, `codium`, `cursor`, `windsurf`, `zed`, `zeditor`, `subl`, `idea`, `webstorm`, `pycharm`, `goland`, `clion`, `rider`; with none, the system default app. `/iui editor <name>` picks one, `/iui editor default` uses the system default app, and `/iui editor <command with {path} {line} {column}>` runs your own command (split on spaces, no shell). The setting is kept across sessions.
+- **A preview of pasted image paths.** When you paste the path of an image file (path text that you copied), Claude Code shows `[Image #N]` but writes no file until you send the prompt. The mod now reads the clipboard one time to find the file, and shows its preview. Absolute paths, `~/` paths, paths from the session folder, `file://` URLs, quoted paths and paths with escaped spaces work. It shows PNG, JPEG and WebP files (JPEG and WebP need Typst).
+
+### Fixed
+
+- **Copies from other apps are not overwritten.** A click or a drag that still reads the text of its page now waits for the clipboard read of a newer copy from another app, and then copies nothing. A second copy of the same text, a text that the mod copied before, and a password manager's copy on Wayland now count as a newer copy. `/iui off` and `/clear` stop a copy that is still pending.
+- **The plan question waits for the plan's pictures** (45 s at most). If they do not show (Typst fails, or over ssh a page is too large), Claude Code's own dialog asks, with the plan as text. After you edit the plan, the mod asks in all cases, and a toast tells you if its pictures did not show.
+- **Edit the plan on macOS without `code`.** The plan opens in your default text editor, and you choose "Done editing" when you saved it. Before, the mod waited until the editor app quit (10 minutes at most).
+- **Converted pictures.** Two sessions that convert the same JPEG, WebP, SVG or PDF at the same time no longer break each other's conversion.
+- **An empty row above the previews.** The previews of pasted images no longer touch the line above them (for example "Crunched for 7s").
+
+## 0.3.3 (2026-10-23)
+
+### New
+
+- **A preview of pasted images above the prompt box.** When you paste an image (`[Image #N]`), a small preview of it shows above the prompt box before you send the prompt, with its number (`#N`) at its left. Typst makes a copy of the image that fills the cells of the preview (a very wide or tall image shows whole, with an empty strip). The previews show side by side, approximately 5 rows tall. When you delete the `[Image #N]` text, or send or clear the prompt, the preview goes away. Refer to [Preview of pasted images](docs/usage.md#preview-of-pasted-images).
+- **herdr support** (the terminal multiplexer). In a herdr pane, Claude Code needs `CLAUDE_CODE_FORCE_TERMINAL_IMAGES=1` to show pictures. The mod asks one time to add the shell line, as in iTerm2. `/iui setup` also adds it. Then close the pane and open a new herdr pane. herdr must run in a terminal that shows kitty pictures (kitty, Ghostty or iTerm2). Refer to [Terminals](docs/install.md#terminals).
+- **herdr in iTerm2.** iTerm2 shows each row of a herdr picture from the bottom of the image, so the rows of a page showed in the wrong order. When the herdr client in use is iTerm2, the mod stores the bands of rows of each page and picture in reverse order. Then iTerm2 shows them in the correct order. `/iui details` shows `pages and pictures stored upside down by rows` when this is on. It does not work with `herdr --remote` in iTerm2.
+- `/iui setup` works in herdr on Linux too.
+- `/iui details` names herdr, its version, the terminal that it runs in and how the mod found that terminal, for example `herdr 0.9.5 (in kitty, the terminal in front)`. If the mod uses the variables of the herdr server, it shows `(in Ghostty, from the server's start)`.
+- **A one-line installer.** `curl -fsSL https://intelligentui.art/install.sh | bash` checks the system and Claude Code, installs Typst 0.15.1 when no Typst 0.15 or later is found (the official release from GitHub, checked against a SHA-256 in the script, into `~/.local/bin`), adds the `razorback16` marketplace and installs the mod with the `claude plugin` commands (a `razorback16` marketplace from another source, such as a fork, a pinned ref or a local folder, is added again from GitHub; a second user copy from another marketplace is uninstalled), and turns on auto-update for the marketplace in `~/.claude/settings.json` (`extraKnownMarketplaces`, with a backup of the file before the auto-update change; all other settings stay byte for byte; an `"autoUpdate": false` that you set stays). Run it again to update. It never uses `sudo`. When iTerm2 or herdr is there, it also adds the mod's `/iui setup` block to your shell's start file (with a backup). `IUI_NO_TYPST=1`, `IUI_NO_AUTO_UPDATE=1` and `IUI_NO_SHELL_SETUP=1` skip a step. Refer to [The install script](docs/install.md#the-install-script).
+- **A new logo and a plugin icon.** Terminal cells and a prompt that become a typeset integral sign. It is the plugin icon (`.claude-plugin/icon.png`, 1024 px) and the icon of the site.
+
+### Fixed
+
+- **The newest copy wins.** A click, a picture selection's up, `/iui grab` and the `ui.copy` change of picture cells each read their text first. An older one that was still reading wrote the clipboard over a newer copy. Now it writes nothing when a newer copy came: a newer click or up, a `$.ui.copy` (another plugin's, or the command button of a link row), Claude Code's own copy of a selection, or a copy in another app. A `ui.copy` change that lost its turn is refused. `/iui grab`, a click on no target and an up with no text copy nothing and cancel no other copy. An older copy (a click, an up, `/iui grab` or a `ui.copy` change) waits for a newer click or up that still reads its text, so it never writes first and is then overwritten. A copy in another app counts from the time the clipboard changed, not from the time the mod read it.
+- **A password manager's copy is never read.** On macOS the mod reads the clipboard with a short `perl` script (PerlObjCBridge) in place of `pbpaste`, and stops at a copy with a concealed or transient type. On Linux, `xclip`, `wl-paste` and GTK look for the `x-kde-passwordManagerHint` target before and after the read. On Wayland, a copy marked sensitive was skipped already.
+- **The code in an answer can read no other file.** Each compile of an answer or a plan had `/` as its Typst root, so a Typst block could read any file (`read`, `include`, `image`, `json`, `csv`), and `read("/dev/zero")` used all the memory. Now each compile runs in a root of its own, with only the template, the theme and the answer's images. The skill's `check.sh` does the same, and it stops with an error when its cache folder is a link or not yours. Pictures are the same as before.
+- `/iui setup` with bash on macOS writes the first of `~/.bash_profile`, `~/.bash_login` and `~/.profile` that exists. Before, it made `~/.bash_profile`, and a login bash then no longer read `~/.profile`.
+- In a session that shows pictures already, `/iui setup` says so, not to open a new tab.
+- `/iui setup`, `/iui setup remove` and the setup question never write a shell start file that they cannot read (no permission, or too large). Before, such a file was replaced with only the Intelligent UI block. Now the mod changes no file and shows the line to add.
+- **Plan mode:** when Claude Code runs two `ExitPlanMode` calls at once, the mod does not ask its question, so the answer for one plan can not go to the other (a rejected plan was allowed). Claude Code's own dialog asks.
+- `/iui theme` runs one at a time: an older `/iui theme` that was still loading no longer sets its theme over a newer one. A setting that you change with `/iui` while the mod starts is kept (before, the start set it back to the stored value).
+- A long session no longer keeps the last text of each answer in memory: the mod keeps the newest 1,024, as it does for the compile results.
+- The picture select highlight could stop on a page whose frames went out of the page cache while its build waited. That page is now built again.
+- The watcher no longer sends `kill` to the PID of a child that ended (the PID can be another process's).
+- On Linux, the GTK clipboard read, watch and check run Python isolated (`-I`): a `gi.py` in the session's project folder no longer runs.
+- When `$.ui.selection()` fails, a `ui.copy` of picture cells and `/iui grab` copy again (before, they said that a newer copy came first).
+- A clipboard read that fails (an error or the 2 s timeout), or a late read of one of the mod's last 4 copies, no longer cancels a newer copy.
+- In herdr, the mod now uses the font and the background of the terminal that herdr runs in (Ghostty, kitty, iTerm2, cmux or Rio). Before, it used Menlo and the OS appearance, so the text could be dark on a dark background.
+  - With the `auto` theme, the background comes from herdr: herdr gives the background of the terminal in front (OSC 11). This also works with `herdr --remote`. The mod asks only at the start and when you change to a different terminal, never on a timer, because the question reads the tty that Claude Code reads. Refer to [Limitations](docs/limitations.md).
+  - The font comes from the herdr client that you use. You can attach to one herdr server from more than one terminal, for example from Ghostty and from kitty. On macOS, the mod uses the client in the terminal app in front. When the app in front is not a terminal (for example a browser), it keeps the last client. On Linux, and between two clients in the same app, it uses the client where you typed last. When you change to a different terminal, the mod finds it at the next check (every 1 s), reads its font and draws the pictures again. If the mod cannot find the client, it uses the variables of the terminal that started the herdr server.
+- In herdr, a tall page of a long answer did not show (herdr does not send an image that is too large to the terminal). Refer to [Limitations](docs/limitations.md).
+- herdr in iTerm2: the last rows of a page taller than 255 rows no longer go missing, and a picture that two sessions stored at the same time no longer stays blank.
+- At a page break between two blocks (for example a paragraph and a list, or a table and a heading), the next page starts with the same gap as in one page. Before, the gap was lost. With the row grid off, the gap can be up to 1 row larger. At a break between two items of a list, the gap is the gap between the items (it was 1 or 2 rows too large).
+
+### Changed
+
+- On Linux, `xsel` no longer reads the clipboard: it cannot show the targets of a copy, so it cannot skip a password manager's copy. Install `xclip` (or GTK 3 for Python); `/iui details` tells you.
+- The README has a **Privacy and access** section: the network request, the clipboard reads and writes, the files, the processes and the Typst root.
+- The shell line of `/iui setup` sets the variable in iTerm2 and in herdr. `/iui setup` replaces the line of an older version. In herdr, the mod asks to update an older line. In iTerm2, the older line still works, and the mod does not ask.
+- In herdr, pages are shorter, so that each page is at most 16 MiB as pixels.
+- **Pasted images in the transcript look the same as their preview.** After you send the prompt, the images show under it side by side, approximately 5 rows tall, with no number. They do not use `/iui height` now (sent images and Typst drawings still do). Claude Code's own `[Image #N]` rows stay under them.
+
 ## 0.3.2 (2026-10-21)
 
 ### New

@@ -122,6 +122,41 @@ export function splitSegments(md: string, columns: number, budget = SEGMENT_ROWS
   return texts.map(t => `${t}\n\n${defs.filter(d => !t.includes(d)).join('\n')}`.trimEnd())
 }
 
+// A list item's first line, and its indent.
+const ITEM = /^( {0,3})(?:[-+*]|\d{1,9}[.)])(?:[ \t]|$)/
+
+// The first line of a list block's last item (`last`) or first item; null
+// when the block is no list, or that line opens a fence or math.
+function itemLine(block: Block, last: boolean): string | null {
+  const head = ITEM.exec(block.lines[0] ?? '')
+  if (!head || block.fence || block.isMath) return null
+  const items = block.lines.filter(line => ITEM.exec(line)?.[1] === head[1])
+  const line = (last ? items.at(-1) : items[0])!
+  return /`{3}|~{3}|\$\$/.test(line) ? null : line
+}
+
+// The blocks at each break between segments, for the gap the template puts
+// there: the last block above the break and the first below it (a fence as
+// a short one of its kind, a typst fence with no code; link definitions are
+// no block). Two lists: only the first lines of the items at the break (the
+// two in one flow make a loose list, which would add gaps inside them). Null
+// for the first segment and where a side has no block.
+export function seamsOf(segments: readonly string[]): ([string, string] | null)[] {
+  const short = (block: Block) => {
+    const { fence } = block
+    if (!fence) return block.lines.join('\n')
+    return [block.lines[0]!, ...(isTypstInfo(fence.info) ? [] : ['x']), fence.mark].join('\n')
+  }
+  const ends = segments.map(seg => blocksOf(seg).filter(b => b.fence || !b.lines.every(line => LINK_DEF.test(line))))
+  return ends.map((blocks, i) => {
+    const above = ends[i - 1]?.at(-1)
+    const below = blocks[0]
+    if (!above || !below) return null
+    const [a, b] = [itemLine(above, true), itemLine(below, false)]
+    return a !== null && b !== null ? [a, b] : [short(above), short(below)]
+  })
+}
+
 // A segment whose page came out taller than an Image can be, cut in two by
 // the same rules (at half its rows); one piece when it can not be cut.
 export function splitInTwo(md: string, columns: number, size = 100, roomRows = DRAWING_ROWS): string[] {

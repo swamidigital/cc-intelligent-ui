@@ -12,7 +12,7 @@ import { drawnAnswers, S } from './state'
 import { compareVersions } from './updates'
 import { joinSegments, pageTopsOf, textOfRun, type Drawn, type Item, type RunLine, type TextBlock } from './copy'
 import { endFold, foldNew, FRAME_MS, pokeFold, showSelection, startFold } from './blit'
-import { clockAfter, clockEvery, uiSelection } from './api'
+import { delay, every, uiSelection } from './api'
 import { targetAt, type PageTarget } from './targets'
 import type { ShownLink } from './draw'
 
@@ -25,8 +25,8 @@ export type SelectPhase = 'down' | 'move' | 'up' | 'clear' | 'hover' | 'leave'
 // rows as the Client has them (for the trace). A hover (the pointer with no
 // button down; anchor and head its cell) or a leave carries the up or clear
 // posted before it (`end`): a later post of one frame replaces an earlier
-// one.
-export type SelectPost = { id: string; page: number; anchor: Point; head: Point; phase: SelectPhase; seq: number; size?: Box; end?: SelectPost }
+// one. `alt`: a clear whose down had alt held (the click copies).
+export type SelectPost = { id: string; page: number; anchor: Point; head: Point; phase: SelectPhase; seq: number; size?: Box; alt?: boolean; end?: SelectPost }
 // The selection: anchor and head in the drawing's rows (the page tops
 // added), `isUp` once the button came up.
 export type Selection = { id: string; anchor: Point; head: Point; isUp: boolean }
@@ -57,7 +57,7 @@ export const clickLinks = new Map<string, readonly ShownLink[]>()
 let fold = foldNew()
 export function redrawSelection($: EngineInterface) {
   const next = pokeFold(fold, performance.now(), FRAME_MS)
-  if (next.kind === 'wait') clockAfter($, next.ms, () => void runSelection($))
+  if (next.kind === 'wait') delay($, next.ms, () => void runSelection($))
   else if (next.kind === 'run') void runSelection($)
 }
 
@@ -110,7 +110,8 @@ export const sameLit = (a: Lit | null, b: Lit | null) => a === b || (!!a && !!b 
 // answer stays the last one made, so only a new one counts (one there
 // before ours stays as it is).
 export const NATIVE_POLL_MS = 250
-const UNREAD = '\0'
+// Not read yet; no nativeOf value is this (those hold a '|').
+const UNREAD = 'unread'
 const native = { timer: null as { cancel: () => void } | null, last: UNREAD as string | undefined }
 const nativeOf = (s: { text: string; requestId?: string } | undefined) => (s ? `${s.requestId ?? ''}|${s.text}` : undefined)
 
@@ -119,7 +120,7 @@ export function watchNative($: EngineInterface, clear: () => void) {
   if (native.timer) return
   native.last = UNREAD
   try {
-    native.timer = clockEvery($, NATIVE_POLL_MS, () => void pollNative($, clear).catch(() => undefined))
+    native.timer = every($, NATIVE_POLL_MS, () => void pollNative($, clear).catch(() => undefined))
   } catch {
     native.timer = null
     return
@@ -162,7 +163,8 @@ export function postOf(data: unknown, isEnd = false): SelectPost | null {
   const size = d.size as Partial<Box> | null | undefined
   const known = size && isInt(size.columns) && isInt(size.rows) ? { size: { columns: size.columns, rows: size.rows } } : {}
   const end = !isEnd && (phase === 'hover' || phase === 'leave') && d.end ? postOf(d.end, true) : null
-  return { id: d.id, page: d.page, anchor, head, phase, seq: d.seq, ...known, ...(end ? { end } : {}) }
+  const alt = phase === 'clear' && d.alt === true ? { alt: true } : {}
+  return { id: d.id, page: d.page, anchor, head, phase, seq: d.seq, ...known, ...alt, ...(end ? { end } : {}) }
 }
 
 // The row each page starts at in its drawing (the pages one under the other).

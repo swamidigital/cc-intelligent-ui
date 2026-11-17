@@ -14,51 +14,42 @@ Intelligent UI draws each answer from Claude as a typeset picture, with [Typst](
 
 ## Install
 
-```
-brew install typst
-```
-
-On Linux, you can also use `cargo install --locked typst-cli`, a package of your distribution, or the release file from GitHub. Refer to [Install](docs/install.md#install-typst-on-linux).
-
-Then, in Claude Code:
+On macOS or Linux:
 
 ```
-/plugin install cc-intelligent-ui --marketplace razorback16/cc-intelligent-ui
+curl -fsSL https://intelligentui.art/install.sh | bash
 ```
 
-It works at once, with no restart.
+It installs Typst if needed, installs the mod and turns on auto-update. Then restart Claude Code. Run it again to update. [What the script does](docs/install.md#the-install-script).
 
-Intelligent UI works best in fullscreen mode (recommended). To use it, run `/tui fullscreen` in Claude Code.
+**By hand:** install [Typst](https://typst.app) 0.15 (`brew install typst`), then in Claude Code type `/plugin install cc-intelligent-ui --marketplace razorback16/cc-intelligent-ui`, and turn on auto-update in `/plugin`. [Install guide](docs/install.md).
 
-To get new versions, turn on auto-update for the `razorback16` marketplace in `/plugin`, or update manually. Refer to [Update](docs/install.md#update). The mod also shows a notice when a new version is available (`/iui updates off` stops it).
+Needs Claude Code 2.1.298 or later. Works best in fullscreen mode (`/tui fullscreen`).
 
-You need Claude Code 2.1.298 or later, [Typst](https://typst.app) 0.15, and macOS or Linux (X11 or Wayland). The pictures show only in some terminals:
+## Terminals
 
-| Terminal | Pictures | What to do |
-|---|---|---|
-| kitty 0.28+, Ghostty, cmux (macOS) | Yes | Nothing |
-| iTerm2 3.6+ (macOS) | Yes | Run `/iui setup` one time |
-| Rio 0.5.27+ | Yes (not tested) | Set `CLAUDE_CODE_FORCE_TERMINAL_IMAGES=1` |
-| ssh | Yes, from kitty or Ghostty | Refer to [Install](docs/install.md#terminals) |
-| tmux, screen | No | — |
-| Warp | Not yet | Support comes when [warpdotdev/warp#16312](https://github.com/warpdotdev/warp/pull/16312) is merged |
-| WezTerm | Not yet | Support comes when [wezterm/wezterm#7924](https://github.com/wezterm/wezterm/pull/7924) is merged |
-| Konsole, Terminal.app, Alacritty, VS Code, Windows Terminal, GNOME Terminal, others | No | — |
+| Terminal | Pictures |
+|---|---|
+| kitty 0.28+, Ghostty, cmux | Yes |
+| iTerm2 3.6+, herdr | Yes, after `/iui setup` (the install script does it) |
+| Rio 0.5.27+ | Yes, with `CLAUDE_CODE_FORCE_TERMINAL_IMAGES=1` (not tested) |
+| ssh | Yes, from kitty or Ghostty |
+| Warp, WezTerm | Not yet (waiting on [warp#16312](https://github.com/warpdotdev/warp/pull/16312), [wezterm#7924](https://github.com/wezterm/wezterm/pull/7924)) |
+| tmux, screen, Terminal.app, Alacritty, VS Code, others | No: you see normal text |
 
-In other terminals, the mod shows the normal text. Refer to [Install](docs/install.md#terminals) for all the details, and run `/iui details` to see why pictures do or do not show.
+`/iui details` tells you why pictures do or do not show. [All terminal details](docs/install.md#terminals).
 
 ![Claude explains why an API request is slow: a timing chart shows the DB query takes 310 of 450 ms, with Amdahl's law and a table of fixes, in a dark and a light terminal](outcomes/out/0-hero-2-latency.png)
 
-## Why
+## Features
 
-- **Rendered Markdown.** Headings, tables, task lists, block quotes and code with syntax colours, in your terminal's own font.
-- **LaTeX math.** Inline `$…$` and display `$$…$$` math, typeset.
-- **Live diagrams, charts and plots.** Claude writes Typst with CeTZ, cetz-plot and fletcher. The drawings use your theme's colours and work offline. For a complex drawing, Claude loads the bundled `intelligent-ui` skill, with the full API and a compile check.
-- **Images and files.** Images in an answer, images that Claude sends, Markdown files that Claude sends, and images that you paste show in the transcript.
-- **Copy text from pictures.** In fullscreen mode, drag over a picture with the mouse, as you do over normal text. The mod highlights the selected text and copies it when you release the button. Refer to [Copy text from a picture](docs/usage.md#copy-text-from-a-picture).
-- **Links you can click.** The links, file paths and commands of an answer show in rows under its picture. A cmd+click on a link opens it. A click on a command copies it.
-- **Plans you can read.** In plan mode, the plan shows rendered, with an approve, edit or reject question under it.
-- **Themes that follow light and dark.** Claude Code's own colours by default, or VS Code's Markdown preview. You can make your own.
+- **Rendered Markdown:** headings, tables, task lists, quotes and highlighted code, in your terminal's font.
+- **LaTeX math:** inline and display, typeset.
+- **Diagrams, charts and plots:** Claude draws them live with Typst, in your theme's colours, offline.
+- **Images and files:** images in answers, images and Markdown files that Claude sends, images that Claude reads (in the expanded row), and a preview of images you paste, above the prompt box.
+- **Copy answers as usual:** in fullscreen, drag over an answer to select and copy its text, as you do with normal text. Click a link or a file to open it (alt+click copies it); click a command to copy it. [How copy works](docs/usage.md#copy-text-from-a-picture).
+- **Readable plans:** plan mode shows the plan rendered, with approve, edit and reject.
+- **Light and dark themes:** Claude Code's colours or VS Code's, or your own.
 
 ## See it
 
@@ -87,30 +78,22 @@ More in the [gallery](docs/gallery.md): plots, fractals and a tour of all the Ma
 
 | Command | What it does |
 |---|---|
-| `/iui` | Shows the state and a problem that keeps pictures away |
-| `/iui on` / `off` | Turns the pictures on or off |
-| `/iui theme <name>` | Changes the theme: `claude-code`, `vscode-modern`, `vscode` or your own |
-| `/iui size <80–200>` | Text size in percent of your terminal text |
-| `/iui grid on` / `off` | Puts each line of text on the terminal rows, so that a mouse selection covers the text (on by default) |
-| `/iui select on` / `off` | Claude Code 2.1.298+, fullscreen: the mod selects and copies picture text with the mouse (on by default) |
-| `/iui updates on` / `off` | Turns the daily check for a new version on or off (on by default) |
-| `/iui details` | Shows the terminal, font, mode and Typst that the mod found |
-| `/iui setup` | iTerm2 (macOS): adds the shell line that turns pictures on |
-| `/iui grab` | Copies the text under your last mouse selection of pictures |
-| `/iui dump` | Shows how the mod read the last clipboard with picture cells (for a bug report) |
+| `/iui` | State, and what keeps pictures away |
+| `/iui on` / `off` | Pictures on or off |
+| `/iui theme <name>` | `claude-code`, `vscode-modern`, `vscode` or your own |
+| `/iui size <80–200>` | Text size, in percent |
+| `/iui setup` | Turns pictures on in iTerm2 and herdr |
+| `/iui grab` | Copies the text of your last selection of pictures |
 
 All commands are in [Usage](docs/usage.md).
 
+## Privacy
+
+Nothing about you or your sessions leaves your computer. The mod makes one request a day at most, for its own public version number (`/iui updates off` stops it). It reads the clipboard only to help a copy or to find a pasted image path, skips password manager copies, and writes it only when you copy. Typst code in an answer cannot read your files. [Full details](docs/privacy.md).
+
 ## Docs
 
-- [Install](docs/install.md): requirements, terminal support and updates
-- [Usage](docs/usage.md): what it draws, the skill, commands, copy, plan approval
-- [Themes](docs/themes.md): built-in themes and your own
-- [How it works](docs/how-it-works.md): the render steps and light or dark mode
-- [Limitations](docs/limitations.md): copy, search, timing and other limits
-- [Development](docs/development.md): build, test and module layout
-- [Gallery](docs/gallery.md): all the sample answers
-- [Changelog](CHANGELOG.md): what changed in each release
+[Install](docs/install.md) · [Usage](docs/usage.md) · [Themes](docs/themes.md) · [How it works](docs/how-it-works.md) · [Limitations](docs/limitations.md) · [Privacy](docs/privacy.md) · [Development](docs/development.md) · [Gallery](docs/gallery.md) · [Changelog](CHANGELOG.md)
 
 ## Disclaimer
 

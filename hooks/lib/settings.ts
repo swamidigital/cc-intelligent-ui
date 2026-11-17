@@ -78,6 +78,15 @@ export const NO_NETWORK = 'http://127.0.0.1:9'
 // how long one read may take.
 export const HOST_POLL_MS = 3000
 export const HOST_CHECK_MS = 2000
+// Under herdr: how often the light client check runs (the app in front and
+// the known clients' tty times), and the most time between two full scans
+// (the process list: new or gone clients).
+export const HERDR_POLL_MS = 1000
+export const HERDR_SCAN_MS = 10000
+// Under herdr the OSC 11 probe (at the start and for a new client) reads the
+// pane's tty, which Claude Code reads too: a key typed then can go to the
+// probe. So it does not run within this time of a key in the prompt box.
+export const OSC11_QUIET_MS = 2000
 // Copy: how often the watcher reads the clipboard's change count (macOS;
 // one call in the watcher, no process), and the word positions of how
 // many pages are kept in memory (a copy probes only the pages it reads).
@@ -94,7 +103,7 @@ export const MODES = ['dark', 'light'] as const
 // terminal's rows.
 export const PICTURE_MAX_ROWS = 24
 export const PICTURE_MIN_ROWS = 6
-// `/iui height`: the most rows an image (sent or pasted) or a Typst
+// `/iui height`: the most rows an image Claude sends or a Typst
 // drawing (the room of a live block or a local image in Markdown; not a
 // whole Markdown page) takes. `half`, the default: as above. `full`: the
 // terminal's rows less PICTURE_ROOM_ROWS. A number: that many rows, at most
@@ -118,6 +127,19 @@ export const gridText = (grid: boolean) => (grid ? 'on (each line of text on who
 export const SELECT_SINCE = '2.1.298'
 export const selectText = (on: boolean) => (on ? 'on (select and copy picture text with the mouse, fullscreen)' : 'off')
 export const PICTURES_KEPT = 64
+// The previews of pasted images (composer.tsx: the band and the rows): about
+// this many rows tall, this many columns apart, and a file not there yet
+// looked for again after PREVIEW_RETRY_MS, PREVIEW_TRIES times at most.
+export const PREVIEW_ROWS = 5
+export const PREVIEW_GAP = 2
+export const PREVIEW_RETRY_MS = 250
+export const PREVIEW_TRIES = 8
+// A pasted path (an `[Image #N]` with no file): the file looked for once
+// more after PATH_RECHECK_MS before the clipboard is read; a clipboard text
+// over PATH_TEXT_MAX chars, or with more than PATHS_MOST paths, is no path list.
+export const PATH_RECHECK_MS = 200
+export const PATH_TEXT_MAX = 4096
+export const PATHS_MOST = 20
 // The file paths of the link rows under a picture: whether each one is a
 // file, kept for this many paths (the oldest go).
 export const LINK_FILES_KEPT = 512

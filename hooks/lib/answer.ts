@@ -10,12 +10,13 @@ import { epochOpen, fauxBoldOf, finalized, keep, lastKey, lastText, live, pendin
 import { fontFit, hashOf, inlineOf, renderKey, sizing } from './draw'
 import { needsRoom } from './markdown'
 import { pictureColumns } from './frame'
+import { isFlipHere } from './terminal'
 import { pictureRowsFor } from './images'
 import { designInMemory, designKey, loadDesign } from './designs'
 import { resultOf, touchLater } from './typst'
 import { enqueue, finalize, forget, waitBlank } from './stream'
 import { extendEpoch } from './epoch'
-import { clockAfter, fsRead } from './api'
+import { delay, cat } from './api'
 
 // `pages`: draw these (with `bytes` over ssh); `blank`: draw an empty box;
 // `text`: draw the engine's own row.
@@ -78,7 +79,7 @@ async function roomOf($: EngineInterface, o: { hasRoom: boolean; textHash: strin
 async function fromDisk($: EngineInterface, env: Env, key: string): Promise<Result | null> {
   if (!S.onDisk.has(key)) return null
   const dir = `${env.cache}/${key}`
-  const text = await fsRead($, `${dir}/pages.json`).catch(() => null)
+  const text = await cat($, `${dir}/pages.json`).catch(() => null)
   const got = text ? resultOf(text) : null
   if (!got) {
     S.onDisk.delete(key)
@@ -105,16 +106,17 @@ export async function pagesOf($: EngineInterface, o: PagesInput): Promise<Drawin
     return o.canStream && (live.has(id) || (seen !== text && !finalized.has(id) && (S.stepsLive > 0 || seen !== undefined)))
   }
   const room = await roomOf($, { hasRoom, textHash, base, env, rows, widthPt, rowPt, isLive: liveNow() })
+  const flip = isFlipHere(env)
   const key = renderKey({
     textHash, columns, cell, size: S.size, mode: S.theme, termFont: env.termFont,
-    columnPt, templateStamp: env.stamp, look: active, inline: env.inline, base, room, grid: S.grid, fauxBold: fauxBoldOf(env.metrics),
+    columnPt, templateStamp: env.stamp, look: active, inline: env.inline, herdr: env.herdr, flip, base, room, grid: S.grid, fauxBold: fauxBoldOf(env.metrics),
   })
   const seen = lastText.get(id)
   const changed = seen !== text
-  lastText.set(id, text)
+  keep(lastText, id, text, RESULTS_KEPT)
   const job: Job = {
     key, requestId: id, text, columns, cell, theme: S.theme, size: S.size, grid: S.grid, themeDir: active.dir, env, epoch: S.epoch,
-    ...(base ? { base } : {}), ...(room ? { room } : {}), ...(o.onScreen !== undefined ? { onScreen: o.onScreen } : {}),
+    ...(base ? { base } : {}), ...(room ? { room } : {}), ...(flip ? { flip } : {}), ...(o.onScreen !== undefined ? { onScreen: o.onScreen } : {}),
   }
   // The picture drawn last for the same text, at another key.
   const was = lastKey.get(id)
@@ -158,7 +160,7 @@ export async function pagesOf($: EngineInterface, o: PagesInput): Promise<Drawin
     const was = live.get(id)
     if (!was || changed) {
       was?.still.cancel()
-      const still = clockAfter($, S.stepsLive > 0 ? LIVE_STILL_MS : SETTLE_MS, () => finalize($, id, false))
+      const still = delay($, S.stepsLive > 0 ? LIVE_STILL_MS : SETTLE_MS, () => finalize($, id, false))
       live.set(id, { job, still })
     } else live.set(id, { job, still: was.still })
     pending.get(id)?.timer.cancel()

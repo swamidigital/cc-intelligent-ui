@@ -7,7 +7,7 @@ import type { EngineInterface } from 'claude-code'
 
 import { S } from './state'
 import { isSet } from './terminal'
-import { clockAfter, clockNow, envGet, fsRead, httpFetch, pluginRoot, sessionSurfaces, storeGet, storeSet, uiToast, type EnvName } from './api'
+import { delay, nowMs, getenv, cat, http, pluginRoot, surf, load, save, toast, type EnvName } from './api'
 
 // The manifest of upstream's newest release (a release changes its
 // `version`): in this fork, the check says that upstream has a release to
@@ -123,16 +123,16 @@ export function updateNotice(o: UpdateState): string {
 // read once per load. Never rejects.
 export function loadUpdates($: EngineInterface): Promise<void> {
   S.updatesLoading ??= (async () => {
-    S.updates = (await storeGet($, 'updates').catch(() => undefined)) !== false
+    S.updates = (await load($, 'updates').catch(() => undefined)) !== false
     S.updatesOff = ''
     for (const name of UPDATE_ENV) {
-      if (!isSet(await envGet($, name).catch(() => undefined))) continue
+      if (!isSet(await getenv($, name).catch(() => undefined))) continue
       S.updatesOff = name
       break
     }
-    const manifest = await fsRead($, `${pluginRoot($)}/.claude-plugin/plugin.json`).catch(() => '')
+    const manifest = await cat($, `${pluginRoot($)}/.claude-plugin/plugin.json`).catch(() => '')
     S.ownVersion = versionOf(manifest) ?? ''
-    S.updateChecked = checkedOf(await storeGet($, 'update-check').catch(() => undefined))
+    S.updateChecked = checkedOf(await load($, 'update-check').catch(() => undefined))
   })().catch(() => {
     S.updatesLoading = null
   })
@@ -147,8 +147,8 @@ export async function fetchLatest($: EngineInterface): Promise<string | null> {
   const timeout = new Promise<null>(resolve => (late = resolve))
   let timer: { cancel: () => void } | undefined
   try {
-    timer = clockAfter($, UPDATE_FETCH_MS, () => late(null))
-    const got = await Promise.race([httpFetch($, UPDATE_URL).catch(() => null), timeout])
+    timer = delay($, UPDATE_FETCH_MS, () => late(null))
+    const got = await Promise.race([http($, UPDATE_URL).catch(() => null), timeout])
     return got?.ok ? versionOf(got.text) : null
   } catch {
     return null
@@ -161,9 +161,9 @@ export async function fetchLatest($: EngineInterface): Promise<string | null> {
 async function tellUpdate($: EngineInterface, now: number) {
   const latest = S.updateChecked?.latest ?? ''
   if (!latest || !isNewer(latest, S.ownVersion)) return
-  if (!shouldTell(toldOf(await storeGet($, 'update-told').catch(() => undefined)), latest, now)) return
-  await storeSet($, 'update-told', { version: latest, at: now }).catch(() => undefined)
-  uiToast($, updateToast(latest, S.ownVersion), { timeoutMs: UPDATE_TOAST_MS })
+  if (!shouldTell(toldOf(await load($, 'update-told').catch(() => undefined)), latest, now)) return
+  await save($, 'update-told', { version: latest, at: now }).catch(() => undefined)
+  toast($, updateToast(latest, S.ownVersion), { timeoutMs: UPDATE_TOAST_MS })
 }
 
 // Once per load, after the start (the end of setUp, or a turn's start, or
@@ -178,22 +178,22 @@ export async function checkUpdates($: EngineInterface): Promise<void> {
   try {
     await loadUpdates($)
     if (!S.updates || S.updatesOff || !S.ownVersion) return
-    if ((await envGet($, 'CLAUDE_CODE_SESSION_KIND').catch(() => undefined)) === 'bg') {
+    if ((await getenv($, 'CLAUDE_CODE_SESSION_KIND').catch(() => undefined)) === 'bg') {
       S.updateDone = true
       return
     }
     // None in a -p run; tried again at the next turn.
-    const surfaces = await sessionSurfaces($).catch(() => [] as readonly string[])
+    const surfaces = await surf($).catch(() => [] as readonly string[])
     if (!surfaces.includes('terminal')) return
     S.updateDone = true
-    const now = await clockNow($)
+    const now = await nowMs($)
     if (isDue(S.updateChecked, now)) {
       S.updateChecked = { at: now, latest: S.updateChecked?.latest ?? '' }
-      await storeSet($, 'update-check', S.updateChecked).catch(() => undefined)
+      await save($, 'update-check', S.updateChecked).catch(() => undefined)
       const found = await fetchLatest($)
       if (found) {
         S.updateChecked = { at: now, latest: found }
-        await storeSet($, 'update-check', S.updateChecked).catch(() => undefined)
+        await save($, 'update-check', S.updateChecked).catch(() => undefined)
       }
     }
     await tellUpdate($, now)

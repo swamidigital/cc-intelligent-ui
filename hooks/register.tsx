@@ -13,24 +13,25 @@
 // The work is in ./lib, one topic per module: settings, state (the shared
 // mutable state `S`), markdown, terminal, terminals, mode, themes, command,
 // setup, host, typst, draw, stream, answer (one text through the pipeline),
-// env, images, pictures, plan (the plan approval flow), copy (the text under
+// env, images, pictures, composer (the previews of the images pasted in the
+// draft), plan (the plan approval flow), copy (the text under
 // a mouse copy of the pictures), probe (the drawn pages, and the words of a
 // page a copy reads) and updates (the daily check for a new version). This
 // file joins them to the hooks, and gives the tests the names they import.
-import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register, RenderElement, RenderSurface, RenderViewport } from 'claude-code'
+import { atom, memberOf, read, update } from 'claude-code'
+import type { EngineInterface, Register, RenderElement, RenderSurface, RenderViewport, UiCopyArgs } from 'claude-code'
 
 import {
   DEFAULT_THEME, gridText, heightText, IMAGE_MAX_COLUMNS, MARGIN_TOP, MAX_HEIGHT, MAX_WIDTH, MIN_HEIGHT, MIN_WIDTH, RESULTS_KEPT, TYPST_PROMPT,
   SELECT_SINCE, selectText, typstHintOf, widthText,
 } from './lib/settings'
-import { clip, DEFAULT_METRICS, drawnAnswers, editedPlans, keep, queue, refresh, running, S, subagentPlans, writesLive, type Env, type Job } from './lib/state'
+import { clip, DEFAULT_METRICS, drawnAnswers, editedPlans, jobEnds, keep, ownCopy, pending, queue, refresh, running, S, settingsSet, subagentPlans, writesLive, type Env, type Job } from './lib/state'
 import { beginEpoch } from './lib/epoch'
 import { escapeControls, luminanceOf, modeLine, modeOfLuminance, parseOsc11, settingOf } from './lib/mode'
 import { applyTheme, themeListing, userThemesOf } from './lib/themes'
 import { commandSuggestions, parseCommand, registerCommand } from './lib/command'
 import { runSetup } from './lib/setup'
-import { pollHost, PROBE_RUNS, probeOsc11, showMode, USE_OSC11, watchHost } from './lib/host'
+import { pollHost, PROBE_RUNS, probeOsc11, showMode, stopHost, USE_OSC11, watchHost } from './lib/host'
 import { measureFonts } from './lib/typst'
 import { drawPages, linkRowsOf, linksFor, takesSelect, type ShownLink } from './lib/draw'
 import {
@@ -45,23 +46,25 @@ import { finalizeAll } from './lib/stream'
 import { knownTargets, knownWords, noteDrawn, noteDrawnAgain, noteOnScreen, wordsOf, type PageWords } from './lib/probe'
 import { codePointsOf, decodeSelection, hasPlaceholders, joinSegments, pageTopsOf, pickPages, textOfRun, type Drawn, type Pick, type Segment } from './lib/copy'
 import { pagesOf, type Drawing } from './lib/answer'
-import { clipboardNow, clipWatchArgs, clipWayReady, hintText } from './lib/clipboard'
+import { clipboardNow, clipboardRead, clipWatchArgs, clipWayReady, hintText } from './lib/clipboard'
 import { setUp } from './lib/env'
 import { frameFor, noteView, stopWatch, watchFrame, watchState } from './lib/frame'
-import { roomColumns } from './lib/terminal'
-import { onScreenOf, pastedImagePath, pastedNumbers, sentFiles } from './lib/images'
-import { drawPageField, pasteDir, pdfPagesOf, rowsAfter, sentOf, shownOf, underRow, type Shown, type Under } from './lib/pictures'
+import { herdrText, isFlipHere, roomColumns } from './lib/terminal'
+import { onScreenOf, pastedNumbers, readFiles, sentFiles } from './lib/images'
+import { drawPageField, pasteDir, pdfPagesOf, rowsAfter, sentOf, underRow, type Under } from './lib/pictures'
+import { drawPreviews, filePreviews, forgetPaths, keepPaths, pathPaste, pathsOf, previewRetry, previewsOf, previewsUnder, sameNumbers, type Preview } from './lib/composer'
 import { checkUpdates, loadUpdates, updateLine, updateNotice, type UpdateState } from './lib/updates'
-import { clockNow, fsWrite, sessionSurfaces, storeSet, uiCopy, uiLog, uiResolve, uiSelection, uiToast } from './lib/api'
+import { nowMs, write, surf, save, copy, uiSelection, toast, sid, exec, delay } from './lib/api'
+import { detachedArgv, editorNow, OPEN_TIMEOUT_MS, openArgv, openedText, useName, type Use } from './lib/open'
 import {
   currentPlan, decidePlan, decisionOf, drawAskLine, drawPlanResult, drawPlanUse, isPlanQuestion, planFileOf, planInputOf, planOf,
-  planShownOf, scheduleClear, type PlanVerdict,
+  planShownOf, PLAN_DRAW_WAIT_MS, scheduleClear, type PlanVerdict,
 } from './lib/plan'
 
 // The names this module exported before the split (the tests import them).
 export {
   BASE_THEME, DEFAULT_CELL, DEFAULT_HEIGHT, DEFAULT_SIZE, DEFAULT_THEME, DEFAULT_WIDTH, gridText, heightText, IMAGE_MAX_COLUMNS, MAX_HEIGHT, MAX_SIZE, MAX_WIDTH,
-  MIN_HEIGHT, MIN_SIZE, MIN_WIDTH, PICTURE_MAX_ROWS, PICTURE_MIN_ROWS, PICTURE_ROOM_ROWS, SEGMENT_ROWS, TYPST_PROMPT, widthText, type Height, type Width,
+  MIN_HEIGHT, MIN_SIZE, MIN_WIDTH, PICTURE_MAX_ROWS, PICTURE_MIN_ROWS, PICTURE_ROOM_ROWS, PATH_RECHECK_MS, PREVIEW_RETRY_MS, PREVIEW_ROWS, SEGMENT_ROWS, TYPST_PROMPT, widthText, type Height, type Width,
   COMMIT_MAX_MS, COMMIT_MIN_MS, DESIGNS_KEPT_DAYS, RESIZE_QUIET_MS, RESULTS_KEPT, TOUCH_FLUSH_MS,
 } from './lib/settings'
 export { DEFAULT_METRICS, keep, type Cell, type Design, type FontMetrics, type Frame, type Look, type Metrics, type Room } from './lib/state'
@@ -81,10 +84,10 @@ export {
   type ThemeInfo, type ThemeProblem, type ThemeSyntax,
 } from './lib/themes'
 export { commandSuggestions, parseCommand, type Command, type Suggestion } from './lib/command'
-export { hasSetup, SETUP_END, SETUP_NOT_MAC, SETUP_START, setupBlock, shellRcOf, withoutSetup, withSetup, type ShellRc } from './lib/setup'
-export { fcPatternOf, OSC11_PL, perlFor, PROGRAM_FONTS_PL, PROGRAM_FONTS_SH, WATCH_PL } from './lib/host'
+export { hasNewSetup, hasSetup, SETUP_END, SETUP_NOT_MAC, SETUP_START, setupBlock, setupWordsOf, shellRcOf, withoutSetup, withSetup, type ShellRc } from './lib/setup'
+export { fcPatternOf, HERDR_CLIENT_SH, HERDR_TICK_SH, OSC11_PL, perlFor, PROGRAM_FONTS_PL, PROGRAM_FONTS_SH, WATCH_PL } from './lib/host'
 export {
-  convertCall, isSafePage, measureCall, noNetworkEnv, pageRowsOf, parseOd, pngSize, probeCall, resultOf, roomInputs, shouldRetrySafe, typstCall, typstInputs,
+  convertCall, fillCall, isSafePage, measureCall, noNetworkEnv, pageRowsOf, parseOd, pngSize, probeCall, resultOf, roomInputs, shouldRetrySafe, typstCall, typstInputs,
 } from './lib/typst'
 export {
   alignFirstLine, fileHref, firstLineOf, fontFit, hashOf, renderKey, resolveLinks, scaledBulletRow, sizing, type FirstLine, type ShownLink,
@@ -92,22 +95,28 @@ export {
 export { nextJob } from './lib/stream'
 export * from './lib/images'
 export { rowsAfter, type Under } from './lib/pictures'
+export { altOf, cellPixels, filledPath, labelColumns, labelOf, linesOf, previewLayout, sameNumbers } from './lib/composer'
 export * from './lib/copy'
 export { targetAt, targetsOf, type PageTarget, type Target } from './lib/targets'
-export { CLIP_TOOLS, clipToolsOf, clipWayOf, FIND_SH, GTK_READ_PY, GTK_WATCH_PY, hintText, WL_WATCH_SH, X11_WATCH_SH, type ClipTool, type ClipWay } from './lib/clipboard'
+export {
+  CLIP_TOOLS, clipToolsOf, clipWayOf, FIND_SH, GTK_READ_PY, GTK_WATCH_PY, hintText, READ_PL, SECRET_TARGET, SECRET_TYPES, WL_READ_SH, WL_WATCH_SH, X11_WATCH_SH, XCLIP_READ_SH,
+  type ClipTool, type ClipWay,
+} from './lib/clipboard'
 export {
   agoText, checkedOf, compareVersions, isDue, isNewer, parseVersion, shouldTell, toldOf, UPDATE_EVERY_MS, UPDATE_FETCH_MS, UPDATE_STEPS, UPDATE_TOAST_MS,
   UPDATE_URL, updateLine, updateNotice, updateToast, versionOf,
 } from './lib/updates'
 export {
-  choiceOf, decisionOf, editorArgv, feedbackOf, guiEditorOf, LINUX_EDITORS, isPlanQuestion, normalPath, PLAN_ASK_LINE, PLAN_AUTO, PLAN_CLEAR, PLAN_DRAWING, PLAN_EDIT,
-  PLAN_FEEDBACK, PLAN_HEADER, PLAN_IMPLEMENT, PLAN_MANUAL, PLAN_QUESTION, PLAN_QUESTION_EDITED, PLAN_REJECTED, planFileOf, planInputOf,
-  planOf, planOptions, planShownOf, shortPath, verdictOf, type PlanChoice, type PlanVerdict,
+  choiceOf, decisionOf, editorArgv, editorWaits, feedbackOf, guiEditorOf, LINUX_EDITORS, isPlanQuestion, normalPath, PLAN_ASK_LINE, PLAN_AUTO, PLAN_CLEAR, PLAN_DONE,
+  PLAN_DRAW_WAIT_MS, PLAN_DRAWING, PLAN_EDIT, PLAN_EDITED_UNDRAWN, PLAN_EDITING, PLAN_FEEDBACK, PLAN_HEADER, PLAN_IMPLEMENT, PLAN_MANUAL, PLAN_QUESTION, PLAN_QUESTION_EDITED,
+  PLAN_REJECTED, PLAN_REOPEN, planFileOf, planInputOf, planOf, planOptions, planShownOf, shortPath, verdictOf, type PlanChoice, type PlanVerdict,
 } from './lib/plan'
 
 // The atoms the hooks read and write (a copy of each in this file: see state.ts).
 const isOn = atom({ plugin: 'cc-intelligent-ui', key: 'isOn' } as const, true)
 const done = atom({ plugin: 'cc-intelligent-ui', key: 'done' } as const, 0)
+const draft = atom({ plugin: 'cc-intelligent-ui', key: 'draft' } as const, [])
+const filled = atom({ plugin: 'cc-intelligent-ui', key: 'filled' } as const, 0)
 
 // ---- Pictures under rows ----------------------------------------------------
 
@@ -135,7 +144,7 @@ async function pictureEnv($: EngineInterface, e: { viewport?: RenderViewport }):
 function tellFullscreen($: EngineInterface) {
   if (S.fullscreenTold) return
   S.fullscreenTold = true
-  uiToast($, 'Intelligent UI works best in fullscreen mode: run /tui fullscreen', { timeoutMs: 12000 })
+  toast($, 'Intelligent UI works best in fullscreen mode: run /tui fullscreen', { timeoutMs: 12000 })
 }
 
 // The env to draw Markdown pictures with (an answer, a plan): as
@@ -144,6 +153,40 @@ async function answerEnv($: EngineInterface, e: { viewport?: RenderViewport }): 
   const ready = await pictureEnv($, e)
   return ready?.env.typst ? ready : null
 }
+
+// The draft's `[Image #N]` numbers to the `draft` atom, only when they
+// changed (the band above the prompt draws again): a key that keeps them
+// writes nothing. The numbers that are new, in order. Never throws.
+// `draftSeq` counts the box changes seen: an edit's box that comes after a
+// newer change is not noted.
+let draftSeq = 0
+function noteDraft($: EngineInterface, text: string): number[] {
+  try {
+    const now = pastedNumbers(text)
+    if (S.draftImages && sameNumbers(S.draftImages, now)) return []
+    const was = S.draftImages ?? []
+    S.draftImages = now
+    keepPaths(now)
+    // The newest numbers at the write, should two writes cross.
+    void update($, draft, () => S.draftImages ?? []).catch(() => undefined)
+    return now.filter(n => !was.includes(n))
+  } catch {
+    return []
+  }
+}
+
+// New image marks of a paste: those with no file are a pasted path, whose
+// file the clipboard names (composer.tsx pathPaste); the band draws again
+// once one is found. Only while pictures draw here (not over ssh).
+function pastedPaths($: EngineInterface, fresh: number[]) {
+  const envOf = async () => ((await read($, isOn)) && S.env?.canDraw && !S.isRemote ? S.env : null)
+  void pathPaste($, fresh, envOf)
+    .then(found => (found ? update($, draft, ns => [...ns]) : undefined))
+    .catch(() => undefined)
+}
+
+// The change kinds that are no paste: a recall, a clear, an undo, a fill.
+const NOT_PASTES: readonly string[] = ['history', 'clear', 'undo', 'plugin', 'app']
 
 // ---- Rows drawn before ----------------------------------------------------------
 
@@ -172,7 +215,9 @@ type AnswerMemo = { tree: RenderElement; after: number }
 const answers = new Map<string, Memo<AnswerMemo>>()
 const plans = new Map<string, Memo<{ drawing: Drawing; links: ShownLink[] }>>()
 const unders = new Map<string, Memo<Under[]>>()
-const pasted = new Map<string, Memo<Shown[]>>()
+const pasted = new Map<string, Memo<Preview[][]>>()
+const readPreviews = new Map<string, Memo<Preview[][]>>()
+const drafts = new Map<string, Memo<Preview[][]>>()
 
 // The kept value when the inputs and the stamp are the same. A new onScreen
 // is given to the row's jobs that wait or run (their order and whether they
@@ -215,13 +260,47 @@ async function planDrawing(
   return drawn
 }
 
+// Whether a plan's pictures show (pages; over ssh each page can go): its
+// compile is waited for, at most PLAN_DRAW_WAIT_MS. False for a compile that
+// failed, a page too big for `{ png }`, or none in time: the engine's dialog
+// asks, as it shows the plan's text. The pages are the ToolUse row's (the
+// same text, id and Frame, at the last viewport noted: one compile).
+async function planShows($: EngineInterface, toolUseId: string, plan: string): Promise<boolean> {
+  const viewport = S.viewColumns === null ? undefined : { columns: S.viewColumns, rows: S.viewRows ?? 48 }
+  let isOver = false
+  let timer = { cancel: () => {} }
+  const late = new Promise<boolean>(resolve => {
+    timer = delay($, PLAN_DRAW_WAIT_MS, () => resolve(false))
+  })
+  const drawn = async (): Promise<boolean> => {
+    while (!isOver) {
+      // Set first: a compile that ends while this draws is not missed.
+      const ended = new Promise<void>(resolve => jobEnds.add(resolve))
+      const ready = await answerEnv($, {})
+      if (!ready) return false
+      const { drawing } = await planDrawing($, { ...(viewport ? { viewport } : {}), props: {} }, toolUseId, plan, ready)
+      if (drawing.kind === 'pages') return true
+      // Text with nothing pending is final (the compile failed); with it, the compile is slow.
+      if (drawing.kind === 'text' && !pending.has(`plan:${toolUseId}`)) return false
+      await ended
+    }
+    return false
+  }
+  try {
+    return await Promise.race([drawn(), late])
+  } finally {
+    isOver = true
+    timer.cancel()
+  }
+}
+
 // Intelligent UI's own plan question: only on the main loop of a session drawn
 // in a terminal, with Intelligent UI on, Typst found and a terminal that draws
 // (the plan's pictures need all of them). Null otherwise: the engine's
 // dialog asks, as with no mod.
 async function planEnv($: EngineInterface): Promise<Env | null> {
   if (!(await read($, isOn))) return null
-  const surfaces = await sessionSurfaces($).catch(() => [] as readonly string[])
+  const surfaces = await surf($).catch(() => [] as readonly string[])
   if (!surfaces.includes('terminal')) return null
   const ready = S.env ?? (await setUp($).catch(() => null))
   return ready?.typst && ready.canDraw ? ready : null
@@ -232,12 +311,13 @@ async function planEnv($: EngineInterface): Promise<Env | null> {
 // copy that still puts kitty placeholder cells on the clipboard (the main
 // screen's, a native drag over text and pictures) is seen by the watcher
 // (lib/frame.ts), which prints a line when the clipboard changes: the
-// clipboard is read once (pbpaste, wl-paste, xclip, xsel or GTK), and cells
-// that fit a page drawn here get a toast that names /iui grab, which reads
-// them (see lib/copy.ts; the drawn pages and the words of a page are in
-// lib/probe.ts). The clipboard is never written but by a copy the person
-// asked for. No timer reads the clipboard; the selection is read every
-// 250 ms only while a picture selection shows (watchNative).
+// clipboard is read once (perl on macOS, wl-paste, xclip or GTK; never a
+// password manager's copy), and cells that fit a page drawn here get a
+// toast that names /iui grab, which reads them (see lib/copy.ts; the drawn
+// pages and the words of a page are in lib/probe.ts). The clipboard is
+// never written but by a copy the person asked for, and never over a newer
+// copy (isNewest). No timer reads the clipboard; the selection is read
+// every 250 ms only while a picture selection shows (watchNative).
 
 // Notes a drawing for a copy (noteDrawn, noteDrawnAgain), turns on the
 // watcher's clipboard part and queues its pages for picture select's
@@ -295,7 +375,13 @@ function clipChanged($: EngineInterface, count: number | null, first: boolean) {
     return
   }
   clip.count = count
-  if (!first) void readClipboard($).catch(() => undefined)
+  if (first) return
+  changed = ++asked
+  // Undecided until a read that began after it ends: a copy that claims waits for it.
+  let end = () => {}
+  undecided.set(changed, new Promise<void>(r => (end = r)))
+  unread.set(changed, end)
+  void readClipboard($).catch(() => undefined)
 }
 
 // Picture cells on the clipboard (a native copy: their session is not
@@ -306,12 +392,19 @@ function hintGrab($: EngineInterface, text: string) {
   clip.raw = text
   clip.rawRow = undefined
   if (S.debug) traceDebug($, `select: native copy seen: ${decodeSelection(text).filter(seg => seg.kind === 'image').length} picture run(s) on the clipboard`)
-  uiToast($, 'Intelligent UI: picture cells copied; /iui grab puts their text on the clipboard')
+  toast($, 'Intelligent UI: picture cells copied; /iui grab puts their text on the clipboard')
 }
 
-// The clipboard changed: one read (clipboardNow). A clipboard with no
-// placeholders, and our own write, are never touched. A change while a
-// read runs reads once more after it.
+// The clipboard changed: one read (clipboardRead). A clipboard with no
+// placeholders, and our own write, are never touched. A text that no
+// recent $.ui.copy wrote (another app's copy, Claude Code's copy on select, a
+// password manager's: null), even the same text again, is a newer copy; a
+// failed read is none. A change while a read runs reads once more after it.
+// A read decides the changes before it began (`unread`), failed or not.
+const unread = new Map<number, () => void>()
+function readsEnded(upTo: number) {
+  for (const [n, end] of unread) if (n <= upTo) (unread.delete(n), undecided.delete(n), end())
+}
 async function readClipboard($: EngineInterface) {
   if (clip.busy) {
     clip.again = true
@@ -321,14 +414,22 @@ async function readClipboard($: EngineInterface) {
   try {
     do {
       clip.again = false
-      const text = await clipboardNow($)
-      if (text === null || text === clip.seen) continue
-      clip.seen = text
-      if (text === clip.wrote || !hasPlaceholders(text)) continue
-      hintGrab($, text)
+      const n = changed
+      try {
+        const text = await clipboardRead($)
+        if (text === undefined) continue
+        if (text === null || !isOwnChange(text, n)) copies = Math.max(copies, n)
+        if (text === clip.seen) continue
+        clip.seen = text
+        if (text === null || text === clip.wrote || !hasPlaceholders(text)) continue
+        hintGrab($, text)
+      } finally {
+        readsEnded(n)
+      }
     } while (clip.again)
   } finally {
     clip.busy = false
+    readsEnded(Infinity)
   }
 }
 
@@ -346,8 +447,9 @@ function watchClipboard($: EngineInterface) {
 }
 
 // Intelligent UI off, or a /clear (the process goes on): the watcher again
-// with no clipboard part (no reads).
+// with no clipboard part (no reads), and no copy begun before it copies.
 function stopClipboard($: EngineInterface) {
+  copies = ++asked
   if (watchState()?.clip && !clip.none) watchFrame($, null)
 }
 
@@ -363,8 +465,113 @@ function hintOf(isOn: boolean): string {
 // The update check's state now, for /iui, /iui details and /iui updates.
 async function updateState($: EngineInterface): Promise<UpdateState> {
   await loadUpdates($)
-  const now = await clockNow($).catch(() => Date.now())
+  const now = await nowMs($).catch(() => Date.now())
   return { on: S.updates, off: S.updatesOff, own: S.ownVersion, checked: S.updateChecked, now }
+}
+
+// Each copy (a grab, a click, an up, any $.ui.copy, or a copy from outside
+// that the watcher sees) gets a number when it begins (`asked`), and claims
+// the clipboard once it has a text (`copies`: the newest claim). An older
+// one that still reads its text when a newer one claimed copies nothing; a
+// click or an up with nothing to copy claims nothing. `copiedTexts`: the texts of the
+// last 4 $.ui.copy calls whose change the watcher has not read, each with `asked`
+// when it was made (its change, even read late, is no copy from outside).
+let asked = 0
+let copies = 0
+// The number of the last clipboard change the watcher saw (taken when its line came).
+let changed = 0
+const copiedTexts: { text: string; at: number }[] = []
+function noteCopied(text: string) {
+  const own = { text, at: asked }
+  copiedTexts.push(own)
+  if (copiedTexts.length > 4) copiedTexts.shift()
+  return own
+}
+// Whether change n's text is an own write's: the change after the write takes it, once.
+function isOwnChange(text: string, n: number): boolean {
+  const i = copiedTexts.findIndex(own => own.text === text)
+  if (i < 0) return false
+  // A read of an older change that came late: the write's own change is still to come.
+  if (copiedTexts[i]!.at < n) copiedTexts.splice(i, 1)
+  return true
+}
+ownCopy.note = text => {
+  noteCopied(text)
+  copies = ++asked
+}
+
+// The mod's own write, noted here: a $.ui.copy made after an await does not
+// pass the mod's own ui.copy hook. While it runs (`writing`), the hook passes it with no new claim.
+const writing: string[] = []
+// Its change is not read again (clip.wrote, clip.seen); a write that fails leaves them as they were.
+async function copyOwn($: EngineInterface, args: UiCopyArgs) {
+  const own = noteCopied(args.text)
+  const was = { wrote: clip.wrote, seen: clip.seen }
+  clip.wrote = args.text
+  clip.seen = args.text
+  writing.push(args.text)
+  let isCopied = false
+  try {
+    const copied = await copy($, args)
+    isCopied = copied.isCopied
+    return copied
+  } finally {
+    writing.splice(writing.indexOf(args.text), 1)
+    if (!isCopied) {
+      if (copiedTexts.includes(own)) copiedTexts.splice(copiedTexts.indexOf(own), 1)
+      if (clip.wrote === args.text) clip.wrote = was.wrote
+      if (clip.seen === args.text) clip.seen = was.seen
+    }
+  }
+}
+
+// A copy's turn: its number, the native selection when it began, and its
+// end of not knowing yet whether it copies anything (`done`).
+type Turn = { n: number; native: Promise<string>; done: () => void }
+const nativeKey = (s: { text: string; requestId?: string } | undefined) => (s ? `${s.requestId ?? ''}|${s.text}` : '')
+function nativeNow($: EngineInterface): Promise<string> {
+  try {
+    // A failed read is no selection, as grab and the ui.copy hook take it.
+    return Promise.resolve(uiSelection($)).then(nativeKey, () => nativeKey(undefined))
+  } catch {
+    return Promise.resolve(nativeKey(undefined))
+  }
+}
+// The turns that do not know yet whether they copy anything.
+const undecided = new Map<number, Promise<void>>()
+function takeTurn($: EngineInterface, native?: Promise<string>): Turn {
+  const n = ++asked
+  let end = () => {}
+  undecided.set(n, new Promise<void>(r => (end = r)))
+  return { n, native: native ?? nativeNow($), done: () => (undecided.delete(n), end()) }
+}
+
+// A copy that has its text claims the clipboard: false when a newer one
+// claimed. A newer one that does not know yet whether it copies is waited for.
+async function newerDecided(turn: Turn) {
+  for (const [n, decided] of undecided) if (n > turn.n) await decided
+}
+async function claim(turn: Turn): Promise<boolean> {
+  await newerDecided(turn)
+  if (copies > turn.n) return false
+  copies = turn.n
+  return true
+}
+
+// A copy that has its text when it begins (a grab, a $.ui.copy): it claims at once.
+function claimNow($: EngineInterface, native: Promise<string>): Turn {
+  const n = ++asked
+  copies = n
+  return { n, native, done: () => {} }
+}
+
+// Whether a copy is still the newest when its text is read: no newer copy
+// came, and no new native selection (Claude Code copies that itself, past
+// every hook; no poll runs for a click).
+async function isNewest($: EngineInterface, turn: Turn): Promise<boolean> {
+  if (turn.n !== copies) return false
+  const [was, now] = await Promise.all([turn.native, nativeNow($)])
+  return turn.n === copies && was === now
 }
 
 // /iui grab: the last mouse selection, read and copied. With no selection
@@ -384,11 +591,19 @@ async function grab($: EngineInterface): Promise<string> {
   const row = selected?.requestId
   clip.raw = raw
   clip.rawRow = row
-  const read = await readCopy($, raw, row)
-  if (!read.resolved) return `Intelligent UI: found ${read.runs} picture run(s) but could not read them (see /iui dump).`
-  clip.wrote = read.text
-  clip.seen = read.text
-  const copied = await uiCopy($, { text: read.text })
+  // Only a grab that copies takes a turn.
+  const turn = takeTurn($, Promise.resolve(nativeKey(selected)))
+  let read: Awaited<ReturnType<typeof readCopy>>
+  try {
+    read = await readCopy($, raw, row)
+    if (!read.resolved) return `Intelligent UI: found ${read.runs} picture run(s) but could not read them (see /iui dump).`
+    const mine = await claim(turn)
+    turn.done()
+    if (!mine || !(await isNewest($, turn))) return 'Intelligent UI: a newer copy came first; this one copied nothing.'
+  } finally {
+    turn.done()
+  }
+  const copied = await copyOwn($, { text: read.text })
   return copied.isCopied
     ? `Intelligent UI: copied ${read.text.length} chars (${read.resolved} of ${read.runs} picture runs read${row ? `, row ${row}` : ''}).`
     : `Intelligent UI: the copy failed: ${copied.reason}.`
@@ -424,7 +639,7 @@ async function dump($: EngineInterface, on: boolean): Promise<string> {
   const cache = S.env?.cache ?? ''
   if (cache) {
     const full = { raw: clip.raw, codePoints: codePointsOf(clip.raw, 100000), ...(clip.last as object) }
-    await fsWrite($, `${cache}/copy-debug.json`, JSON.stringify(full, null, 1)).catch(() => undefined)
+    await write($, `${cache}/copy-debug.json`, JSON.stringify(full, null, 1)).catch(() => undefined)
   }
   return [
     `Intelligent UI: last clipboard with picture cells (${Array.from(clip.raw).length} code points; grab hint ${hint}):`,
@@ -513,30 +728,70 @@ function lightHover($: EngineInterface) {
   redrawSelection($)
 }
 
-// A click (a clear) on a target of the page copies its text (a link's URL,
-// a file's path, a command, a code block's code). The page's words are probed first when they
-// are not known.
+// A click (a clear) on a target of the page opens a web link or a file
+// (openTarget); an alt+click, a command, a code block's copy button or a
+// click over ssh copies its text (a link's URL, a file's path, a command, a
+// code block's code). The page's words are probed first when they are not
+// known; a newer copy while they are (or a new native selection): the newer
+// one copies. A click on no target, or one that opens, copies nothing and
+// cancels no other copy.
 async function clickAt($: EngineInterface, d: Drawn & { job?: Job }, post: SelectPost, surface: RenderSurface) {
-  const links = () => clickLinks.get(d.id) ?? NO_LINKS
-  let targets = knownTargets(d, post.page, links())
-  if (!targets) {
-    await wordsOf($, d, post.page)
-    targets = knownTargets(d, post.page, links())
+  const turn = takeTurn($)
+  try {
+    const links = () => clickLinks.get(d.id) ?? NO_LINKS
+    let targets = knownTargets(d, post.page, links())
+    if (!targets) {
+      await wordsOf($, d, post.page)
+      targets = knownTargets(d, post.page, links())
+    }
+    const target = targets?.[targetAt(targets, post.anchor.x, post.anchor.y)]?.target
+    const opens = !!target && (target.kind === 'web' || target.kind === 'file') && !post.alt && !S.isRemote
+    if (S.debug) traceDebug($, `select: click ${d.id} page ${post.page} at ${post.anchor.x},${post.anchor.y} target ${target ? target.kind : 'none'}${target ? (opens ? ' open' : ' copy') : ''}`)
+    if (!target) return
+    if (opens) {
+      // An open writes no clipboard: the turn is not claimed.
+      turn.done()
+      await openTarget($, target, surface, turn)
+      return
+    }
+    const mine = await claim(turn)
+    turn.done()
+    if (!mine || !(await isNewest($, turn))) return
+    await copyTarget($, target, surface)
+  } finally {
+    turn.done()
   }
-  const target = targets?.[targetAt(targets, post.anchor.x, post.anchor.y)]?.target
-  if (S.debug) traceDebug($, `select: click ${d.id} page ${post.page} at ${post.anchor.x},${post.anchor.y} target ${target ? target.kind : 'none'}`)
-  if (target) await copyTarget($, target, surface)
 }
 
-// A target's text on the clipboard (clickAt), with its toast.
-async function copyTarget($: EngineInterface, target: Target, surface: RenderSurface) {
+// A web link or a file opened (clickAt), with its toast. One that does not
+// open (no program, an exit code not 0) is copied in the click's turn: a
+// newer copy (or a new native selection) while it opened keeps the clipboard.
+async function openTarget($: EngineInterface, target: Target, surface: RenderSurface, turn: Turn) {
+  const use: Use = target.kind === 'file' ? await editorNow($) : { kind: 'app' }
+  const argv = openArgv(target, { isMac: !!S.env?.isMac, use })
+  const got = argv ? await exec($, detachedArgv(argv), { timeoutMs: OPEN_TIMEOUT_MS }).catch(() => null) : null
+  if (S.debug) traceDebug($, `select: open ${argv?.join(' ') ?? 'none'} exit ${got ? got.exitCode : 'failed'}`)
+  if (got?.exitCode === 0) return void toast($, openedText(target, use))
+  // No argv for a file: the system app could run it (openArgv), so it only copies.
+  const why = argv ? 'failed' : 'type'
+  if (!(await claim(turn)) || !(await isNewest($, turn))) {
+    return void toast($, `Intelligent UI: ${why === 'type' ? NO_OPEN : `could not open the ${target.kind === 'web' ? 'link' : 'file'}`}`)
+  }
+  await copyTarget($, target, surface, why)
+}
+
+const NO_OPEN = 'this file type does not open on click'
+
+// A target's text on the clipboard (clickAt), with its toast; `notOpened`:
+// it is copied as an open of it failed, or as its file type does not open.
+async function copyTarget($: EngineInterface, target: Target, surface: RenderSurface, notOpened?: 'failed' | 'type') {
   const text = target.kind === 'web' ? target.href : target.kind === 'file' ? target.path : target.text
   const name = target.kind === 'web' ? 'link' : target.kind === 'file' ? 'path' : target.kind === 'code' ? 'code' : 'command'
-  // The clipboard change of this text is not read again.
-  clip.wrote = text
-  clip.seen = text
-  const copied = await uiCopy($, { text, surface })
-  uiToast($, copied.isCopied ? `Intelligent UI: copied the ${name}` : `Intelligent UI: the copy failed: ${copied.reason}`)
+  const copied = await copyOwn($, { text, surface })
+  if (notOpened === 'type') return void toast($, `Intelligent UI: ${copied.isCopied ? `copied the path (${NO_OPEN})` : `${NO_OPEN}, and the copy failed: ${copied.reason}`}`)
+  const failed = notOpened ? `could not open the ${target.kind === 'web' ? 'link' : 'file'}` : ''
+  const done = failed ? `${failed}, so copied ${target.kind === 'web' ? 'it' : 'its path'}` : `copied the ${name}`
+  toast($, copied.isCopied ? `Intelligent UI: ${done}` : `Intelligent UI: ${failed ? `${failed}, and ` : ''}the copy failed: ${copied.reason}`)
 }
 
 // The text of a selection's cells, page by page, as a copy of those cells
@@ -554,26 +809,32 @@ async function selectionText($: EngineInterface, d: Drawn & { job?: Job }, sel: 
 }
 
 // The button came up: the selection's text on the clipboard, with the
-// toast of a copy. No text under it: nothing is copied; a newer up while
-// its words are read: the newer one copies.
-let copies = 0
+// toast of a copy. No text under it: nothing is copied (and no other copy
+// is cancelled); a newer up while
+// its words are read (or any newer copy, or a new native selection): the newer one copies.
 async function copySelection($: EngineInterface, d: Drawn & { job?: Job }, sel: Selection, surface: RenderSurface) {
   const t = performance.now()
-  const mine = ++copies
+  const turn = takeTurn($)
   const probed: number[] = []
-  const text = await selectionText($, d, sel, probed)
-  if (mine !== copies) return
-  const read = performance.now() - t
-  if (text === null) {
-    uiToast($, 'Intelligent UI: could not read the selected picture')
-    return
+  let text: string | null
+  try {
+    text = await selectionText($, d, sel, probed)
+    // A newer copy claimed first: no toast either.
+    if (copies > turn.n) return
+    if (text === null) {
+      toast($, 'Intelligent UI: could not read the selected picture')
+      return
+    }
+    if (!text) return
+    const mine = await claim(turn)
+    turn.done()
+    if (!mine || !(await isNewest($, turn))) return
+  } finally {
+    turn.done()
   }
-  if (!text) return
-  // The clipboard change of this text is not read again.
-  clip.wrote = text
-  clip.seen = text
-  const copied = await uiCopy($, { text, surface })
-  uiToast($, copied.isCopied ? `Intelligent UI: copied ${text.length} chars of text` : `Intelligent UI: the copy failed: ${copied.reason}`)
+  const read = performance.now() - t
+  const copied = await copyOwn($, { text, surface })
+  toast($, copied.isCopied ? `Intelligent UI: copied ${text.length} chars of text` : `Intelligent UI: the copy failed: ${copied.reason}`)
   if (S.debug) void traceCopy($, text, performance.now() - t, read, probed)
 }
 
@@ -616,6 +877,43 @@ function releaseSelect($: EngineInterface) {
   forgetPages()
 }
 
+// `/iui theme [name]`, one at a time (`themeRuns`): an older one still
+// reading the themes or measuring fonts would write its look, metrics,
+// epoch and stored name over a newer one's.
+let themeRuns: Promise<unknown> = Promise.resolve()
+function runTheme($: EngineInterface, name: string | undefined): Promise<string> {
+  const run = themeRuns.then(() => setTheme($, name))
+  themeRuns = run.catch(() => undefined)
+  return run
+}
+
+async function setTheme($: EngineInterface, name: string | undefined): Promise<string> {
+  const ready = await setUp($)
+  const was = S.look
+  const wanted = name ?? S.look?.name ?? DEFAULT_THEME
+  const { themes, problems, chosen } = await applyTheme($, ready.root, ready.home, wanted)
+  if (name && chosen.isFallback) {
+    if (was) S.look = was
+    return `No usable theme named ${name}.\n\n${themeListing(themes, problems, was?.name ?? DEFAULT_THEME, userThemesOf(ready.home), ready.home)}`
+  }
+  if (S.look?.name !== was?.name || S.look?.dir !== was?.dir || S.look?.stamp !== was?.stamp) {
+    // The theme's fonts set the column width and the code size; measured again
+    // when the terminal font changed meanwhile (refont), never for an older font.
+    if (ready.typst && S.look) {
+      let font: string
+      do {
+        font = ready.termFont
+        const metrics = await measureFonts($, ready.typst, ready.root, ready.cache, font, S.look.dir)
+        if (font === ready.termFont) ready.metrics = metrics
+      } while (font !== ready.termFont)
+    }
+    beginEpoch($)
+  }
+  if (name) await save($, 'theme-name', chosen.name)
+  const head = name ? `Theme set to ${chosen.name}.\n\n` : ''
+  return `${head}${themeListing(themes, problems, chosen.name, userThemesOf(ready.home), ready.home)}`
+}
+
 // ---- Hooks ----------------------------------------------------------------
 
 export const register: Register = on => {
@@ -629,25 +927,44 @@ export const register: Register = on => {
   // the next picture. Any other end (/exit): the watcher stops, and no new
   // child starts.
   on('session.end', async ($, e, next) => {
+    forgetPaths()
     if (e.reason === 'clear' || e.reason === 'resume') stopClipboard($)
-    else stopWatch()
+    else {
+      stopWatch()
+      stopHost()
+    }
     return next(e)
   }).catch(($, e, next) => next(e))
 
   // A copy with placeholders (a copy of picture cells, when the engine sends
   // one through `$.ui.copy`): the words under them instead. Our own copies
-  // hold no placeholders and pass on as they are.
+  // hold no placeholders and pass on as they are. Any copy is the newest:
+  // one with placeholders whose words are read when a newer one came is refused.
   on('ui.copy', async ($, e, next) => {
-    if (!hasPlaceholders(e.text) || !drawnAnswers.size) return next(e)
+    if (writing.includes(e.text)) return next(e)
+    // The text that goes on the clipboard is noted (copiedTexts), only it.
+    if (!hasPlaceholders(e.text) || !drawnAnswers.size) {
+      noteCopied(e.text)
+      copies = ++asked
+      return next(e)
+    }
     if (S.debug) traceDebug($, 'select: native copy seen: a $.ui.copy with picture cells (read as their text)')
-    const selected = await uiSelection($).catch(() => undefined)
+    const selection = $.ui.selection().catch(() => undefined)
+    const turn = claimNow($, selection.then(nativeKey))
+    const selected = await selection
     clip.raw = e.text
     clip.rawRow = selected?.text === e.text ? selected.requestId : undefined
     const read = await readCopy($, e.text, clip.rawRow)
-    if (!read.resolved) return next(e)
+    await newerDecided(turn)
+    if (!(await isNewest($, turn))) return { value: { isCopied: false, reason: 'refused' } }
+    if (!read.resolved) {
+      noteCopied(e.text)
+      return next(e)
+    }
     // The clipboard change of this write is not read again.
     clip.wrote = read.text
     clip.seen = read.text
+    noteCopied(read.text)
     return next({ ...e, text: read.text })
   }).catch(($, e, next) => next(e))
 
@@ -669,22 +986,36 @@ export const register: Register = on => {
       releaseSelect($)
       // The rows drawn again with no Client.
       refresh($)
-      void Promise.resolve(uiLog($, `Intelligent UI: picture select is off (${e.phase}: ${e.reason})`, { to: 'debug' })).catch(() => undefined)
+      void Promise.resolve($.ui.log(`Intelligent UI: picture select is off (${e.phase}: ${e.reason})`, { to: 'debug' })).catch(() => undefined)
     }
     return next(e)
   }).catch(($, e, next) => next(e))
 
   // Typing in the main prompt takes a picture selection down (a key that
-  // edits, not a bare cursor move); the edit passes on as it is.
+  // edits, not a bare cursor move); the edit passes on as it is. The box
+  // after it gives the draft's pasted images (noteDraft).
   on('prompt.edit', async ($, e, next) => {
-    if (picked.now && (e.inputText || e.end > e.start)) clearSelection($)
-    return next(e)
+    const isEdit = !!e.inputText || e.end > e.start
+    if (picked.now && isEdit) clearSelection($)
+    void Promise.resolve().then(() => nowMs($)).then(t => void (S.keyAt = t), () => undefined)
+    const seq = ++draftSeq
+    const box = await next(e)
+    if (isEdit && e.origin.kind === 'composer' && seq === draftSeq) {
+      const fresh = noteDraft($, box.text)
+      if (fresh.length && e.inputText.includes('[Image #')) pastedPaths($, fresh)
+    }
+    return box
   }).catch(($, e, next) => next(e))
 
   // A change of the prompt box no edit carried (a recalled entry, an undo, a
-  // clear): the same, but not another plugin's fill. Observe only.
+  // clear): the same, but not another plugin's fill. Observe only. Any
+  // change gives the draft's pasted images (a submit clears them).
   on('prompt.change', async ($, e, next) => {
     if (picked.now && e.origin.kind !== 'plugin' && e.origin.kind !== 'app') clearSelection($)
+    draftSeq++
+    const fresh = noteDraft($, e.text)
+    // A path pasted (an engine change): its file from the clipboard.
+    if (fresh.length && !NOT_PASTES.includes(e.origin.kind)) pastedPaths($, fresh)
     return next(e)
   }).catch(($, e, next) => next(e))
 
@@ -696,6 +1027,7 @@ export const register: Register = on => {
     await loadUpdates($)
     const mine = commandSuggestions(e.text, e.token, e.start, {
       themes: S.themeChoices, active: S.look?.name ?? DEFAULT_THEME, size: S.size, width: S.width, height: S.height, grid: S.grid, updates: S.updates, select: S.select,
+      editor: S.editor, onPath: S.onPath, autoEditor: S.autoEditor,
     })
     return mine.length ? { suggestions: [...got.suggestions, ...mine] } : got
   })
@@ -705,29 +1037,35 @@ export const register: Register = on => {
     if (asked.kind === 'grab') return { text: await grab($) }
     if (asked.kind === 'dump') return { text: await dump($, await read($, isOn)) }
     if (asked.kind === 'on' || asked.kind === 'off') {
+      settingsSet.add('enabled')
+      S.isOff = asked.kind === 'off'
+      // Under herdr, its client is checked only while on.
+      watchHost($)
       await update($, isOn, () => asked.kind === 'on')
       // On: the clipboard part starts with the next picture drawn.
       if (asked.kind === 'off') {
         stopClipboard($)
         releaseSelect($)
       }
-      await storeSet($, 'enabled', asked.kind === 'on')
+      await $.store.set('enabled', asked.kind === 'on')
       return { text: `Intelligent UI is ${asked.kind}.` }
     }
     if (asked.kind === 'size') {
       // The epoch begins with the setting, so no row draws it with no epoch
       // open (the store write waits for the host).
       S.size = asked.percent
+      settingsSet.add('size')
       beginEpoch($)
-      await storeSet($, 'size', S.size)
+      await $.store.set('size', S.size)
       return { text: `Intelligent UI draws text at ${S.size}% of the terminal's text size (100% matches it).` }
     }
     if (asked.kind === 'width') {
       if (asked.width === undefined) await setUp($).catch(() => null)
       else {
         S.width = asked.width
+        settingsSet.add('width')
         beginEpoch($)
-        await storeSet($, 'width', S.width)
+        await $.store.set('width', S.width)
       }
       const most = typeof S.width === 'number' && S.width > IMAGE_MAX_COLUMNS ? ` (a picture is ${IMAGE_MAX_COLUMNS} columns at most)` : ''
       const head = asked.width === undefined ? 'The most columns a picture takes' : 'Intelligent UI pictures now take at most'
@@ -737,18 +1075,20 @@ export const register: Register = on => {
       if (asked.height === undefined) await setUp($).catch(() => null)
       else {
         S.height = asked.height
+        settingsSet.add('height')
         beginEpoch($)
-        await storeSet($, 'height', S.height)
+        await $.store.set('height', S.height)
       }
       const head = asked.height === undefined ? 'The most rows an image or a Typst drawing takes' : 'Intelligent UI images and Typst drawings now take at most'
-      return { text: `${head}: ${heightText(S.height)}. This applies to images (sent or pasted) and to Typst drawings in answers. Use /iui height half (the default), /iui height full, or /iui height <${MIN_HEIGHT}-${MAX_HEIGHT}> (never more than full).` }
+      return { text: `${head}: ${heightText(S.height)}. This applies to images that Claude sends and to Typst drawings in answers (images that you paste show small, as their preview above the prompt box). Use /iui height half (the default), /iui height full, or /iui height <${MIN_HEIGHT}-${MAX_HEIGHT}> (never more than full).` }
     }
     if (asked.kind === 'grid') {
       if (asked.grid === undefined) await setUp($).catch(() => null)
       else {
         S.grid = asked.grid
+        settingsSet.add('grid')
         beginEpoch($)
-        await storeSet($, 'grid', S.grid)
+        await $.store.set('grid', S.grid)
       }
       const head = asked.grid === undefined ? 'The row grid is' : 'The row grid is now'
       return { text: `${head} ${gridText(S.grid)}. With the grid on, a mouse selection over a picture covers the lines it copies. Use /iui grid on (the default), or /iui grid off.` }
@@ -757,18 +1097,31 @@ export const register: Register = on => {
       if (asked.on === undefined) await setUp($).catch(() => null)
       else {
         S.select = asked.on
+        settingsSet.add('select')
         if (!S.select) releaseSelect($)
         refresh($)
-        await storeSet($, 'select', S.select)
+        await $.store.set('select', S.select)
       }
       const head = asked.on === undefined ? 'Picture select is' : 'Picture select is now'
       return { text: `${head} ${selectText(S.select)}. When on, a mouse drag over a picture selects its text and copies it. Use /iui select on (the default), or /iui select off.` }
+    }
+    if (asked.kind === 'editor') {
+      if (asked.editor === undefined) await setUp($).catch(() => null)
+      else {
+        S.editor = asked.editor
+        settingsSet.add('editor')
+        await $.store.set('editor', S.editor)
+      }
+      const use = await editorNow($)
+      const head = asked.editor === undefined ? 'The editor for file paths is' : 'The editor for file paths is now'
+      const missed = use.kind !== 'command' && use.missed ? ` ${use.missed} is not on the PATH, so a click uses ${useName(use)}.` : ''
+      return { text: `${head}: ${S.editor} (${useName(use)}).${missed} Use /iui editor auto (the default), /iui editor <name>, /iui editor default (the system app), or /iui editor <command with {path} {line} {column}>.` }
     }
     if (asked.kind === 'updates') {
       await loadUpdates($)
       if (asked.on !== undefined) {
         S.updates = asked.on
-        await storeSet($, 'updates', S.updates)
+        await $.store.set('updates', S.updates)
         // On: the check of this load, if it did not run (it waits 24 h after the last one).
         if (S.updates) void checkUpdates($)
       }
@@ -789,26 +1142,9 @@ export const register: Register = on => {
         const mode = bg ? ` -> luminance ${luminanceOf(bg).toFixed(3)}, ${modeOfLuminance(luminanceOf(bg))}` : got?.reply ? ' -> not an OSC 11 answer' : ''
         lines.push(`${i}: ${what}${mode}`)
       }
-      return { text: `OSC 11 probe (the terminal's background), ${PROBE_RUNS} runs:\n${lines.join('\n')}\nThe poll uses it: ${USE_OSC11 ? 'yes' : 'no (off)'}.` }
+      return { text: `OSC 11 probe (the terminal's background), ${PROBE_RUNS} runs:\n${lines.join('\n')}\nThe poll uses it: ${USE_OSC11 ? 'yes' : S.isHerdr ? 'in herdr, at the start and at a change of client only' : 'no (off)'}.` }
     }
-    if (asked.kind === 'theme') {
-      const ready = await setUp($)
-      const was = S.look
-      const wanted = asked.name ?? S.look?.name ?? DEFAULT_THEME
-      const { themes, problems, chosen } = await applyTheme($, ready.root, ready.home, wanted)
-      if (asked.name && chosen.isFallback) {
-        if (was) S.look = was
-        return { text: `No usable theme named ${asked.name}.\n\n${themeListing(themes, problems, was?.name ?? DEFAULT_THEME, userThemesOf(ready.home), ready.home)}` }
-      }
-      if (S.look?.name !== was?.name || S.look?.dir !== was?.dir || S.look?.stamp !== was?.stamp) {
-        // The theme's fonts set the column width and the code size.
-        if (ready.typst && S.look) ready.metrics = await measureFonts($, ready.typst, ready.root, ready.cache, ready.termFont, S.look.dir)
-        beginEpoch($)
-      }
-      if (asked.name) await storeSet($, 'theme-name', chosen.name)
-      const head = asked.name ? `Theme set to ${chosen.name}.\n\n` : ''
-      return { text: `${head}${themeListing(themes, problems, chosen.name, userThemesOf(ready.home), ready.home)}` }
-    }
+    if (asked.kind === 'theme') return { text: await runTheme($, asked.name) }
     const state = (await read($, isOn)) ? 'on' : 'off'
     const ready = await setUp($)
     const bad = asked.kind === 'bad' ? `Not understood: "${e.args.trim()}".\n` : ''
@@ -817,34 +1153,40 @@ export const register: Register = on => {
       // A measure with no term metrics: Typst does not have the font (it would fall back).
       const missing = !!ready.typst && ready.metrics !== DEFAULT_METRICS && !ready.metrics.term
       const font = !ready.termFont
-        ? `terminal font not known (${ready.isMac ? 'Menlo' : "the theme's code font"} assumed)`
-        : `terminal font ${ready.termFont}${missing ? " (Typst does not have this font, so the pictures use the theme's fonts)" : ''}`
+        ? `terminal font not known (${ready.isMac ? 'Menlo' : "the theme's code font"} assumed${S.isRemote ? '; set IUI_FONT to name it' : ''})`
+        : `terminal font ${ready.termFont}${S.fontByVar ? ' (IUI_FONT)' : ''}${missing ? " (Typst does not have this font, so the pictures use the theme's fonts)" : ''}`
       const typst = ready.typst ? `Typst: ${ready.typst}` : `Typst: not found (${typstHintOf(ready.isMac)})`
       const terminal = S.cacheProblem
         ? `Intelligent UI draws no pictures: ${S.cacheProblem} (it never uses a shared folder instead)`
         : ready.canDraw
-        ? `this terminal draws pictures${ready.inline ? ' (over ssh, sent as bytes)' : ''}`
-        : 'Claude Code draws no pictures here (it does in kitty and Ghostty, in iTerm2 3.6+ and Rio 0.5.27+ with CLAUDE_CODE_FORCE_TERMINAL_IMAGES=1, over ssh when TERM names kitty or Ghostty or with that variable; never in tmux, screen or a background session; not in WezTerm, Warp, Konsole or others), so answers stay text'
+        ? `this terminal draws pictures${ready.inline ? (S.isRemote ? ' (over ssh, sent as bytes)' : ' (sent as bytes: IUI_INLINE)') : ''}`
+        : S.isHerdr && S.setupNeeded
+        ? 'Claude Code draws no pictures in herdr until CLAUDE_CODE_FORCE_TERMINAL_IMAGES=1 is set when it starts (run /iui setup), so answers stay text'
+        : 'Claude Code draws no pictures here (it does in kitty and Ghostty, in iTerm2 3.6+, Rio 0.5.27+ and herdr with CLAUDE_CODE_FORCE_TERMINAL_IMAGES=1, over ssh when TERM names kitty or Ghostty or with that variable; in tmux or screen only with IUI_FORCE=1, in a background session only with IUI_FORCE=1 and CLAUDE_CODE_FORCE_TERMINAL_IMAGES=1; not in WezTerm, Warp, Konsole or others), so answers stay text'
+      // In herdr: its version, the terminal it runs in and where that came from (and flip mode).
+      const herdr = S.isHerdr ? `terminal ${herdrText(S.herdrVersion, S.herdrHost, S.herdrClient ? (S.herdrBy === 'front' ? 'front' : 'client') : 'server', isFlipHere(ready))}: ` : ''
       await clipWayReady()
       const auto = `Picture select: ${selectState()}\n/iui grab hint: ${hintOf(state === 'on')}`
       const updates = `Update checks: ${updateLine(await updateState($))}`
-      return { text: `Intelligent UI is ${state}, theme ${theme}, ${modeLine(S.theme, S.setting, S.settingRaw, S.host)}, text size ${S.size}%, width ${widthText(S.width)}, image and drawing height ${heightText(S.height)}, row grid ${S.grid ? 'on' : 'off'}, picture select ${S.select ? 'on' : 'off'}, ${font}. ${typst}; ${terminal}.\n${auto}\n${updates}` }
+      return { text: `Intelligent UI is ${state}, theme ${theme}, ${modeLine(S.theme, S.setting, S.settingRaw, S.host)}, text size ${S.size}%, width ${widthText(S.width)}, image and drawing height ${heightText(S.height)}, row grid ${S.grid ? 'on' : 'off'}, picture select ${S.select ? 'on' : 'off'}, ${font}. ${typst}; ${herdr}${terminal}.\n${auto}\n${updates}` }
     }
     // The short state: what is set, and only the problems that keep pictures away.
     const sized = (v: number | 'full' | 'half', unit: string) => (typeof v === 'number' ? `${v} ${unit}` : v)
-    const lines = [`Intelligent UI is ${state}: theme ${theme}, ${S.theme}, text ${S.size}%, width ${sized(S.width, 'columns')}, height ${sized(S.height, 'rows')}, grid ${S.grid ? 'on' : 'off'}.`]
+    const lines = [`Intelligent UI is ${state}: theme ${theme}, ${S.theme}, text ${S.size}%, width ${sized(S.width, 'columns')}, height ${sized(S.height, 'rows')}, grid ${S.grid ? 'on' : 'off'}, editor ${S.editor}.`]
     if (S.cacheProblem) lines.push(`No pictures: ${S.cacheProblem}. See /iui details.`)
-    else if (S.setupNeeded) lines.push('In iTerm2, run /iui setup once to show pictures.')
+    else if (S.setupNeeded) lines.push(`In ${S.isHerdr ? 'herdr' : 'iTerm2'}, run /iui setup once to show pictures.`)
     else if (!ready.canDraw) {
-      const where = ready.isMac ? 'kitty, Ghostty and iTerm2 3.6+' : 'kitty and Ghostty, and in Rio with CLAUDE_CODE_FORCE_TERMINAL_IMAGES=1'
+      const where = ready.isMac
+        ? 'kitty, Ghostty and iTerm2 3.6+, and in herdr with /iui setup'
+        : 'kitty and Ghostty, in herdr with /iui setup, and in Rio with CLAUDE_CODE_FORCE_TERMINAL_IMAGES=1'
       lines.push(`This terminal shows no pictures, so answers stay text. Pictures show in ${where}.`)
     }
     if (!ready.typst) lines.push(`Typst is not installed, so answers stay text. Install it: ${typstHintOf(ready.isMac)}`)
     const notice = updateNotice(await updateState($))
     if (notice) lines.push(notice)
-    lines.push('Change: /iui on | off | size | width | height | grid | select | updates | theme. More: /iui details')
+    lines.push('Change: /iui on | off | size | width | height | grid | select | editor | updates | theme. More: /iui details')
     return { text: bad + lines.join('\n') }
-  })
+  }).catch(($, e, next) => next(e))
 
   on('config.set', { key: 'theme' }, async ($, e, next) => {
     const set = await next(e)
@@ -852,7 +1194,7 @@ export const register: Register = on => {
     S.settingRaw = typeof set.value === 'string' ? set.value : ''
     S.setting = settingOf(set.value)
     // Not awaited: the setting is saved at once; the OS read redraws later.
-    if (S.setting === 'auto') void pollHost($).catch(() => undefined)
+    if (S.setting === 'auto') void pollHost($, true).catch(() => undefined)
     else showMode($)
     watchHost($)
     return set
@@ -952,7 +1294,7 @@ export const register: Register = on => {
     }
     answers.delete(e.requestId)
     if (drawing.kind === 'text') return next(e)
-    const { Box } = uiResolve($, e)
+    const { Box } = $.ui.resolve(e)
     return <Box />
   })
 
@@ -1016,6 +1358,40 @@ export const register: Register = on => {
     }
   })
 
+  // The image Claude opens with Read, as a small preview (as a pasted
+  // image's) under its expanded row (ctrl+o, --verbose, an unfolded group);
+  // the folded line shows no file, so none there.
+  on('ui.render', { component: 'ToolUse', props: { tool: 'Read' } }, async ($, e, next) => {
+    if (e.surface !== 'terminal' || e.props.isErrored) return next(e)
+    const files = readFiles(e.props.input, e.props.output).map(f => f.path)
+    if (!files.length) return next(e)
+    let lines: Preview[][] = []
+    try {
+      const ready = await pictureEnv($, e)
+      const mine = memberOf(filled, e)
+      if (ready) await read($, mine)
+      const k = { text: files.join('\n'), extra: '', stamp: ready ? stampOf(ready, e.viewport) : '', onScreen: undefined }
+      const kept = ready ? memoOf(readPreviews, e.requestId, k, () => false) : undefined
+      if (kept) lines = kept
+      else if (ready) {
+        const redraw = () => void update($, mine, n => n + 1).catch(() => undefined)
+        const made = await filePreviews($, e.viewport, ready.env, files, { columns: roomColumns(e.viewport), redraw })
+        lines = made.lines
+        if (lines.length && made.isFinal) memoSet(readPreviews, e.requestId, k, lines)
+        else readPreviews.delete(e.requestId)
+      }
+    } catch {
+      lines = []
+    }
+    const row = await next(e)
+    if (!lines.length) return row
+    try {
+      return previewsUnder($, e, row, lines)
+    } catch {
+      return row
+    }
+  })
+
   // The page field of a PDF under a SendUserFile row (pictures.tsx askPage):
   // the pane PAGE_PANE, named as a literal so the validator reads it.
   on('ui.render', { component: 'Pane', requestId: 'iui-page' }, async ($, e, next) => {
@@ -1023,33 +1399,80 @@ export const register: Register = on => {
     return drawPageField($, e)
   })
 
-  // The images the user pasted (`[Image #N]`), under the prompt row. Only the
-  // user's own prompts: a notification's or another agent's row stays as is.
+  // The images the user pasted (`[Image #N]`), under the prompt row, as
+  // their preview above the prompt box was (composer.tsx). Only the user's
+  // own prompts: a notification's or another agent's row stays as is. The
+  // row reads its member of `filled`, which goes up when a filled copy is
+  // made: that row alone draws again.
   on('ui.render', { component: 'UserMessage' }, async ($, e, next) => {
     if (e.surface !== 'terminal' || e.props.origin?.kind !== 'composer' || e.props.from || e.props.task) return next(e)
     const numbers = pastedNumbers(e.props.text)
     if (!numbers.length) return next(e)
-    let shown: Shown[] = []
+    let lines: Preview[][] = []
     try {
       const ready = await pictureEnv($, e)
+      const mine = memberOf(filled, e)
+      if (ready) await read($, mine)
       const k = { text: e.props.text, extra: '', stamp: ready ? stampOf(ready, e.viewport) : '', onScreen: undefined }
       const kept = ready ? memoOf(pasted, e.requestId, k, () => false) : undefined
-      if (kept) shown = kept
+      if (kept) lines = kept
       else if (ready) {
-        const dir = await pasteDir($, ready.env)
-        if (dir) shown = await shownOf($, e, ready.env, numbers.map(n => pastedImagePath(dir, n)), { done: ready.done, row: e.requestId })
-        if (shown.length) memoSet(pasted, e.requestId, k, shown)
+        const redraw = () => void update($, mine, n => n + 1).catch(() => undefined)
+        const made = await previewsOf($, e.viewport, ready.env, numbers, { columns: roomColumns(e.viewport), maxRows: Number.POSITIVE_INFINITY, labelled: false, redraw })
+        lines = made.lines
+        if (lines.length && made.isFinal) memoSet(pasted, e.requestId, k, lines)
         else pasted.delete(e.requestId)
       }
     } catch {
-      shown = []
+      lines = []
     }
     const row = await next(e)
-    if (!shown.length) return row
+    if (!lines.length) return row
     try {
-      return underRow($, e, row, shown)
+      return previewsUnder($, e, row, lines)
     } catch {
       return row
+    }
+  })
+
+  // The images pasted in the draft (`[Image #N]`), as small previews above
+  // the prompt box until it is sent, then the band beneath. A survey, no
+  // image, or no picture drawn: the band as it is.
+  on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
+    if (e.surface !== 'terminal' || e.props.hasSurvey) return next(e)
+    let lines: Preview[][] = []
+    try {
+      const numbers = await read($, draft)
+      if (!numbers.length) drafts.delete('draft')
+      const ready = numbers.length ? await pictureEnv($, e) : null
+      if (ready) {
+        // The paste folder in the key: a new session (/clear) numbers from #1 again.
+        const dir = await pasteDir($, ready.env)
+        // The files of pasted paths (by the session: /clear numbers from #1 again).
+        const paths = pathsOf(await sid($), numbers)
+        const named = [...paths].map(([n, path]) => `${n}=${path}`).join('\n')
+        const k = { text: numbers.join(','), extra: `${e.props.bodyColumns}x${e.props.maxRows}|${dir}|${named}`, stamp: stampOf(ready, e.viewport), onScreen: undefined }
+        const kept = memoOf(drafts, 'draft', k, () => false)
+        if (kept) lines = kept
+        else {
+          // The same numbers written again: only the band reads them.
+          const redraw = () => void update($, draft, ns => [...ns]).catch(() => undefined)
+          const made = await previewsOf($, e.viewport, ready.env, numbers, { columns: e.props.bodyColumns, maxRows: e.props.maxRows - 1, labelled: true, redraw, paths })
+          lines = made.lines
+          if (made.isWhole && made.isFinal) memoSet(drafts, 'draft', k, lines)
+          else drafts.delete('draft')
+          if (!made.isWhole) previewRetry($, `${dir}|${k.text}`, redraw)
+        }
+      }
+    } catch {
+      lines = []
+    }
+    const band = await next(e)
+    if (!lines.length) return band
+    try {
+      return drawPreviews($, e, lines, band)
+    } catch {
+      return band
     }
   })
 
@@ -1149,57 +1572,69 @@ export const register: Register = on => {
   // dialog while PermissionRequest hooks run, so a question asked there waits
   // behind it). The person's words deny the call (Claude revises the plan);
   // a verdict waits for the PermissionRequest below, and is dropped once the
-  // call resolves, so it never reaches a later call. No env, no plan, or a
-  // failure: no verdict, and the engine's dialog asks.
+  // call resolves, so it never reaches a later call. No env, no plan, no
+  // pictures of it (planShows), or a failure: no verdict, and the engine's
+  // dialog asks. The engine may run two calls at once, and a
+  // PermissionRequest does not say which call it is for: a call that begins
+  // while another runs asks nothing (the engine's dialog asks), and no
+  // verdict is used while two run.
   on('tool.call', { tool: 'ExitPlanMode' }, async ($, e, next) => {
     if (e.agentId) {
       subagentPlans.add(e.tool_use_id)
       return next(e)
     }
-    S.planVerdict = null
-    let verdict: PlanVerdict | null = null
+    S.plansLive++
     try {
-      const ready = await planEnv($)
-      const callPlan = ready ? planInputOf(e) : ''
-      if (ready && callPlan) {
-        const id = e.tool_use_id
-        const file = planFileOf(e)
-        const plan = await currentPlan($, file, callPlan)
-        // Always: the row's input is the message's copy, read before an Edit in the same message.
-        editedPlans.set(id, plan)
-        refresh($)
-        const outcome = await decidePlan($, {
-          plan, callPlan, file, isMac: ready.isMac, isRemote: S.isRemote,
-          onEdited: text => {
-            editedPlans.set(id, text)
-            refresh($)
-          },
-        })
-        if (outcome.kind === 'feedback') return { deny: outcome.message }
-        verdict = outcome.verdict
-      }
-    } catch {
-      verdict = null
-    }
-    S.planVerdict = verdict
-    const turnId = S.mainTurnId
-    let got: Awaited<ReturnType<typeof next>>
-    try {
-      got = await next(e)
-    } finally {
+      if (S.plansLive > 1) return await next(e)
       S.planVerdict = null
+      let verdict: PlanVerdict | null = null
+      try {
+        const ready = await planEnv($)
+        const callPlan = ready ? planInputOf(e) : ''
+        if (ready && callPlan) {
+          const id = e.tool_use_id
+          const file = planFileOf(e)
+          const plan = await currentPlan($, file, callPlan)
+          // Always: the row's input is the message's copy, read before an Edit in the same message.
+          editedPlans.set(id, plan)
+          refresh($)
+          const outcome = await decidePlan($, {
+            plan, callPlan, file, isMac: ready.isMac, isRemote: S.isRemote,
+            onEdited: text => {
+              editedPlans.set(id, text)
+              refresh($)
+            },
+            isDrawn: text => planShows($, id, text),
+          })
+          if (outcome.kind === 'feedback') return { deny: outcome.message }
+          if (outcome.kind === 'verdict') verdict = outcome.verdict
+        }
+      } catch {
+        verdict = null
+      }
+      S.planVerdict = verdict
+      const turnId = S.mainTurnId
+      let got: Awaited<ReturnType<typeof next>>
+      try {
+        got = await next(e)
+      } finally {
+        S.planVerdict = null
+      }
+      // The call has run: a failure to schedule changes nothing of its result.
+      try {
+        if (verdict?.kind === 'allow' && verdict.clear && got && typeof got === 'object' && !('deny' in got)) scheduleClear($, verdict.plan, turnId)
+      } catch {}
+      return got
+    } finally {
+      S.plansLive--
     }
-    // The call has run: a failure to schedule changes nothing of its result.
-    try {
-      if (verdict?.kind === 'allow' && verdict.clear && got && typeof got === 'object' && !('deny' in got)) scheduleClear($, verdict.plan, turnId)
-    } catch {}
-    return got
   }).catch(($, e, next) => next(e))
 
   // The PermissionRequest of that call: Intelligent UI's verdict at once (the
-  // engine's dialog never shows), else the engine's flow.
+  // engine's dialog never shows), else the engine's flow (also while two
+  // calls run: the verdict may be the other call's).
   on('classic.PermissionRequest', async ($, e, next) => {
-    if (e.tool_name !== 'ExitPlanMode' || e.agent_id || !S.planVerdict) return next(e)
+    if (e.tool_name !== 'ExitPlanMode' || e.agent_id || !S.planVerdict || S.plansLive !== 1) return next(e)
     const verdict = S.planVerdict
     S.planVerdict = null
     return { decision: decisionOf(verdict, e.tool_input) }

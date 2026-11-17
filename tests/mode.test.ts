@@ -1,5 +1,8 @@
 import { expect, mock, test } from 'claude-code/testing'
 
+import { HERDR_CLIENT_SH, HERDR_TICK_SH } from '../hooks/register'
+import { S } from '../hooks/lib/state'
+
 // Claude Code's theme on auto, on a Mac in light mode: the OS read gives light.
 test('with the theme on auto, the mode comes from the OS appearance, read every 3 s', async ($, on) => {
   mock.store(on)
@@ -127,6 +130,235 @@ test('with the theme on auto, Ghostty draws as its background is', async ($, on)
   expect((await $.command.run({ command: 'iui', args: 'details' } as any)).text).toContain('mode dark (auto, from Ghostty: theme Night background)')
 })
 
+// herdr in Ghostty on a light Mac: herdr's TERM_PROGRAM hides Ghostty, but
+// its GHOSTTY_RESOURCES_DIR is kept, so Ghostty's dark config counts.
+test('with the theme on auto, herdr in Ghostty draws as the Ghostty background is', async ($, on) => {
+  mock.store(on)
+  mock.clock(on)
+  mock.env(on, { HOME: '/h', TERM_PROGRAM: 'herdr', HERDR_ENV: '1', TERM: 'xterm-256color', GHOSTTY_RESOURCES_DIR: '/R', CLAUDE_CODE_FORCE_TERMINAL_IMAGES: '1' })
+  on('config.list', async () => ({ value: [{ key: 'theme', value: 'auto' }] as any }))
+  const ok = (stdout: string, exitCode = 0) => ({ value: { exitCode, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
+  on('process.run', async ($: any, e: any, next: any) => {
+    const argv: string[] = e.argv
+    const cmd = argv.join(' ')
+    if (argv[0] === 'sh' && /cc-intelligent-ui-/.test(cmd)) return ok('/tmp/mdp\nDarwin\n')
+    if (argv[0] === 'sh' && cmd.includes('+show-config')) return ok('background = #1d1f21\n')
+    if (argv[0] === 'defaults' && argv.includes('AppleInterfaceStyle')) return ok('', 1)
+    return next(e)
+  })
+  const ran = await $.command.run({ command: 'iui', args: 'details' } as any)
+  expect(ran.text).toContain('mode dark (auto, from Ghostty: config background)')
+})
+
+// herdr in iTerm2 on a light Mac: ITERM_PROFILE is kept, so the profile counts.
+test('with the theme on auto, herdr in iTerm2 draws as the iTerm2 profile is', async ($, on) => {
+  mock.store(on)
+  mock.clock(on)
+  mock.env(on, { HOME: '/h', TERM_PROGRAM: 'herdr', HERDR_ENV: '1', TERM: 'xterm-256color', ITERM_PROFILE: 'Default', CLAUDE_CODE_FORCE_TERMINAL_IMAGES: '1' })
+  on('config.list', async () => ({ value: [{ key: 'theme', value: 'auto' }] as any }))
+  const dark = { 'Red Component': 0.11, 'Green Component': 0.15, 'Blue Component': 0.17 }
+  const marks = JSON.stringify([{ Name: 'Default', Guid: 'G1', 'Background Color': dark }])
+  const ok = (stdout: string, exitCode = 0) => ({ value: { exitCode, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
+  on('process.run', async ($: any, e: any, next: any) => {
+    const argv: string[] = e.argv
+    const cmd = argv.join(' ')
+    if (argv[0] === 'sh' && /cc-intelligent-ui-/.test(cmd)) return ok('/tmp/mdp\nDarwin\n')
+    if (argv[0] === 'sh' && cmd.includes('TabStyleWithAutomaticOption')) return ok(`0\n@\nG1\n@\n${marks}\n`)
+    if (argv[0] === 'defaults' && argv.includes('AppleInterfaceStyle')) return ok('', 1)
+    return next(e)
+  })
+  const ran = await $.command.run({ command: 'iui', args: 'details' } as any)
+  expect(ran.text).toContain('mode dark (auto, from iTerm2: profile Default background)')
+  expect(ran.text).toContain("terminal herdr (in iTerm2, from the server's start): ")
+})
+
+// herdr in Ghostty (the server's variables), with pictures, the theme on
+// auto: `answers` are herdr's OSC 11 replies in turn ('' or none left: no
+// answer), `config` Ghostty's +show-config, `run` answers a command first.
+const herdrOk = (stdout: string, exitCode = 0) => ({ value: { exitCode, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
+function herdrWorld(on: any, o: {
+  answers?: string[]
+  config?: () => string
+  env?: Record<string, string>
+  stored?: Record<string, unknown>
+  setting?: string
+  run?: (argv: string[]) => ReturnType<typeof herdrOk> | undefined
+}) {
+  S.keyAt = Number.NEGATIVE_INFINITY
+  mock.store(on, o.stored)
+  const clock = mock.clock(on)
+  mock.env(on, { HOME: '/h', TERM_PROGRAM: 'herdr', HERDR_ENV: '1', TERM: 'xterm-256color', GHOSTTY_RESOURCES_DIR: '/R', CLAUDE_CODE_FORCE_TERMINAL_IMAGES: '1', ...o.env })
+  on('config.list', async () => ({ value: [{ key: 'theme', value: o.setting ?? 'auto' }] as any }))
+  on('config.set', async ($: any, e: any) => ({ value: e.value }))
+  on('tool.call', { tool: 'AskUserQuestion' }, async () => ({ deny: 'dismissed' }))
+  on('prompt.edit', async ($: any, e: any) => ({ text: e.text + e.inputText, cursor: e.text.length + e.inputText.length }))
+  const w = { probes: 0, clock }
+  on('process.run', async ($: any, e: any, next: any) => {
+    const argv: string[] = e.argv
+    const cmd = argv.join(' ')
+    const own = o.run?.(argv)
+    if (own) return own
+    if (argv[0] === 'sh' && /cc-intelligent-ui-/.test(cmd)) return herdrOk('/tmp/mdp\nDarwin\n')
+    if (argv[0] === 'perl' && cmd.includes('11;?')) return herdrOk(o.answers?.[w.probes++] ?? '')
+    if (argv[0] === 'sh' && cmd.includes('+show-config')) return herdrOk(o.config?.() ?? 'background = #1d1f21\n')
+    if (argv[0] === 'defaults' && argv.includes('AppleInterfaceStyle')) return herdrOk('', 1)
+    return next(e)
+  })
+  return w
+}
+const modeOf = async ($: any) => (await $.command.run({ command: 'iui', args: 'details' } as any)).text as string
+const typeKey = async ($: any) => ($ as any).prompt.edit({ origin: { kind: 'composer' }, text: '', cursor: 0, start: 0, end: 0, inputText: 'a' })
+const WHITE = '\x1b]11;rgb:ffff/ffff/ffff\x1b\\'
+const BLACK = '\x1b]11;rgb:0000/0000/0000\x07'
+const HERDR_LIGHT = 'mode light (auto, from herdr: OSC 11 background of the terminal in front)'
+
+// herdr answers OSC 11 with the background of the terminal in front: it is
+// the first source of auto. The probe reads the tty that Claude Code reads
+// (a key or a mouse report can go to it), so it runs at the start, not on
+// a timer: the answer stays while the terminal's config (or the OS) gives
+// the mode it gave then, and a change there wins.
+test('with the theme on auto, herdr asks OSC 11 at the start only, keeps the answer while the config stays, and follows a change of the config', async ($, on) => {
+  let config = 'background = #1d1f21\n'
+  const w = herdrWorld(on, { answers: [WHITE], config: () => config })
+  expect(await modeOf($)).toContain(HERDR_LIGHT)
+  expect(w.probes).toBe(1)
+  // No timed probe: 30 s of polls (each 1 s, the mode each 3 s) ask nothing.
+  await w.clock.advance(30000)
+  expect(w.probes).toBe(1)
+  expect(await modeOf($)).toContain(HERDR_LIGHT)
+  // Ghostty's config changes (a theme that follows the OS): it wins at the next mode read.
+  config = 'background = #fafafa\n'
+  await w.clock.advance(3000)
+  expect(await modeOf($)).toContain('mode light (auto, from Ghostty: config background)')
+  config = 'background = #1d1f21\n'
+  await w.clock.advance(3000)
+  expect(await modeOf($)).toContain('mode dark (auto, from Ghostty: config background)')
+  expect(w.probes).toBe(1)
+})
+
+// A missed answer (Claude Code read it): tried again at the next polls, 3 times at most.
+test('under herdr, a missed OSC 11 answer is asked at most 3 times, then the config counts', async ($, on) => {
+  const w = herdrWorld(on, { answers: [] })
+  expect(await modeOf($)).toContain('mode dark (auto, from Ghostty: config background)')
+  await w.clock.advance(10000)
+  expect(w.probes).toBe(3)
+  await w.clock.advance(20000)
+  expect(w.probes).toBe(3)
+  expect(await modeOf($)).toContain('mode dark (auto, from Ghostty: config background)')
+})
+
+// The start probe waits until 2 s pass with no key in the prompt box.
+test('under herdr, the start OSC 11 probe waits for 2 s with no key in the prompt', async ($, on) => {
+  try {
+    const w = herdrWorld(on, { answers: [WHITE] })
+    await typeKey($)
+    await w.clock.settle()
+    expect(await modeOf($)).toContain('mode dark (auto, from Ghostty: config background)')
+    expect(w.probes).toBe(0)
+    // A key each 500 ms for 6 s: no probe.
+    for (let i = 0; i < 12; i++) {
+      await typeKey($)
+      await w.clock.advance(500)
+    }
+    expect(w.probes).toBe(0)
+    // 2 s with no key: the next poll asks, once.
+    await w.clock.advance(3000)
+    expect(w.probes).toBe(1)
+    expect(await modeOf($)).toContain(HERDR_LIGHT)
+    await w.clock.advance(9000)
+    expect(w.probes).toBe(1)
+  } finally {
+    S.keyAt = Number.NEGATIVE_INFINITY
+  }
+})
+
+// Where the mod draws no herdr pictures, or is off, or the theme was not
+// auto at the start (/config is a dialog: a key there is not seen), no probe.
+for (const [why, o] of [
+  ['Claude Code draws no pictures (setup not done)', { env: { CLAUDE_CODE_FORCE_TERMINAL_IMAGES: '' } }],
+  ['the mod is stored off', { stored: { enabled: false } }],
+] as const) {
+  test(`under herdr with the theme on auto, no OSC 11 probe when ${why}`, async ($, on) => {
+    try {
+      const w = herdrWorld(on, { answers: [WHITE], ...o })
+      await modeOf($)
+      await w.clock.advance(9000)
+      expect(w.probes).toBe(0)
+      expect(await modeOf($)).toContain('mode dark (auto, from Ghostty: config background)')
+    } finally {
+      S.isOff = false
+    }
+  })
+}
+
+test('under herdr, the theme set to auto later asks no OSC 11 (a dialog can be open), not even at the next polls', async ($, on) => {
+  const w = herdrWorld(on, { answers: [WHITE], setting: 'dark' })
+  await modeOf($)
+  await $.config.set({ key: 'theme', value: 'auto' } as any)
+  await w.clock.advance(9000)
+  expect(w.probes).toBe(0)
+  expect(await modeOf($)).toContain('mode dark (auto, from Ghostty: config background)')
+})
+
+// A new herdr client (another terminal in front) is asked again, once.
+test('under herdr, a new client in front is asked OSC 11 again, once', async ($, on) => {
+  const ghostty = 'pid 50390\natime 10\ntty ttys012\ncmd herdr\napp /Applications/Ghostty.app/Contents/MacOS/ghostty -e herdr\nenv\nherdr TERM=xterm-ghostty TERM_PROGRAM=ghostty GHOSTTY_BIN_DIR=/G\n'
+  const kitty = 'pid 54346\natime 20\ntty ttys021\ncmd herdr\napp /Applications/kitty.app/Contents/MacOS/kitty herdr\nenv\nherdr TERM=xterm-kitty KITTY_WINDOW_ID=1\n'
+  let front = 'com.mitchellh.ghostty'
+  const w = herdrWorld(on, {
+    answers: [BLACK, WHITE],
+    run: argv =>
+      argv[2] === HERDR_CLIENT_SH ? herdrOk(`front ${front}\n${ghostty}${kitty}`)
+      : argv[2] === HERDR_TICK_SH ? herdrOk(`front ${front}\n${argv.slice(5).map(tty => `atime ${tty} 10\n`).join('')}`)
+      : undefined,
+  })
+  expect(await modeOf($)).toContain('mode dark (auto, from herdr: OSC 11 background of the terminal in front)')
+  await w.clock.advance(5000)
+  expect(w.probes).toBe(1)
+  front = 'net.kovidgoyal.kitty'
+  await w.clock.advance(1000)
+  expect(w.probes).toBe(2)
+  expect(await modeOf($)).toContain(HERDR_LIGHT)
+  await w.clock.advance(9000)
+  expect(w.probes).toBe(2)
+})
+
+// herdr --remote: the pane is over ssh (the mod runs on the remote
+// computer), but herdr's OSC 11 answer is still the user's terminal; it
+// stays while COLORFGBG (the only other source there) does not change.
+test('with the theme on auto, a remote herdr pane takes the OSC 11 background at the start, before COLORFGBG', async ($, on) => {
+  const w = herdrWorld(on, {
+    answers: [BLACK],
+    env: { GHOSTTY_RESOURCES_DIR: '', SSH_CONNECTION: '1 2 3 4', COLORFGBG: '0;15' },
+    run: argv => (argv[0] === 'sh' && /cc-intelligent-ui-/.test(argv.join(' ')) ? herdrOk('/tmp/mdp\nLinux\n') : undefined),
+  })
+  expect(await modeOf($)).toContain('mode dark (auto, from herdr: OSC 11 background of the terminal in front)')
+  await w.clock.advance(9000)
+  expect(await modeOf($)).toContain('mode dark (auto, from herdr: OSC 11 background of the terminal in front)')
+  expect(w.probes).toBe(1)
+})
+
+// herdr with no hint of its terminal: as before, COLORFGBG, then the OS.
+test('with the theme on auto, herdr in a terminal it does not know follows the OS', async ($, on) => {
+  mock.store(on)
+  mock.clock(on)
+  mock.env(on, { HOME: '/h', TERM_PROGRAM: 'herdr', HERDR_ENV: '1', TERM: 'xterm-256color', CLAUDE_CODE_FORCE_TERMINAL_IMAGES: '1' })
+  on('config.list', async () => ({ value: [{ key: 'theme', value: 'auto' }] as any }))
+  const ok = (stdout: string, exitCode = 0) => ({ value: { exitCode, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
+  const ran: string[] = []
+  on('process.run', async ($: any, e: any, next: any) => {
+    const argv: string[] = e.argv
+    const cmd = argv.join(' ')
+    ran.push(cmd)
+    if (argv[0] === 'sh' && /cc-intelligent-ui-/.test(cmd)) return ok('/tmp/mdp\nDarwin\n')
+    if (argv[0] === 'defaults' && argv.includes('AppleInterfaceStyle')) return ok('', 1)
+    return next(e)
+  })
+  const got = await $.command.run({ command: 'iui', args: 'details' } as any)
+  expect(got.text).toContain('mode light (auto, from macOS)')
+  expect(ran.some(c => c.includes('+show-config') || c.includes('TabStyleWithAutomaticOption'))).toBe(false)
+})
+
 // kitty on a light Mac: kitty.conf's included theme is dark; once auto theme
 // files exist, the one for the OS scheme is used.
 test('with the theme on auto, kitty draws as its config or auto theme is', async ($, on) => {
@@ -212,10 +444,53 @@ for (const colorFgBg of [undefined, '0;15']) {
     on('fs.read', async ($: any, e: any, next: any) => (e.path.includes('kitty') ? (asked.push(e.path), { deny: 'no such file' } as any) : next(e)))
     const ran = await $.command.run({ command: 'iui', args: 'details' } as any)
     expect(ran.text).toContain(colorFgBg ? 'mode light (auto, from COLORFGBG)' : 'mode dark (auto, OS appearance not known, dark assumed)')
-    expect(ran.text).toContain('terminal font not known (Menlo assumed)')
+    expect(ran.text).toContain('terminal font not known (Menlo assumed; set IUI_FONT to name it)')
     expect(asked).toEqual([])
   })
 }
+
+// Over ssh, IUI_FONT and IUI_MODE (from the remote shell's start file) name
+// what the mod can't read: IUI_MODE before COLORFGBG, the font as installed here.
+test('over ssh, IUI_FONT names the terminal font and IUI_MODE the mode for auto', async ($, on) => {
+  mock.store(on)
+  mock.clock(on)
+  mock.env(on, { HOME: '/h', TERM: 'xterm-ghostty', SSH_CONNECTION: '10.0.0.2 50000 10.0.0.1 22', COLORFGBG: '15;0', IUI_FONT: ' JetBrains Mono ', IUI_MODE: 'Light' })
+  on('config.list', async () => ({ value: [{ key: 'theme', value: 'auto' }] as any }))
+  const ok = (stdout: string, exitCode = 0) => ({ value: { exitCode, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
+  const families: string[] = []
+  on('process.run', async ($: any, e: any, next: any) => {
+    const argv: string[] = e.argv
+    if (argv[0] === 'sh' && /cc-intelligent-ui-/.test(argv.join(' '))) return ok('/tmp/mdp\nDarwin\n')
+    if (argv[0] === 'osascript' && argv.includes('JetBrains Mono')) return (families.push(argv.at(-1)!), ok('yes\n'))
+    return next(e)
+  })
+  const ran = await $.command.run({ command: 'iui', args: 'details' } as any)
+  expect(ran.text).toContain('mode light (auto, from IUI_MODE)')
+  expect(ran.text).toContain('terminal font JetBrains Mono (IUI_FONT)')
+  expect(families).toEqual(['JetBrains Mono'])
+})
+
+// Where the mod reads the terminal (here kitty's config), the variables wait.
+test("on this computer, the terminal's own font and mode win over IUI_FONT and IUI_MODE", async ($, on) => {
+  mock.store(on)
+  mock.clock(on)
+  mock.env(on, { HOME: '/h', TERM: 'xterm-kitty', KITTY_WINDOW_ID: '1', IUI_FONT: 'Courier', IUI_MODE: 'light' })
+  on('config.list', async () => ({ value: [{ key: 'theme', value: 'auto' }] as any }))
+  const ok = (stdout: string, exitCode = 0) => ({ value: { exitCode, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
+  on('process.run', async ($: any, e: any, next: any) => {
+    const argv: string[] = e.argv
+    if (argv[0] === 'sh' && /cc-intelligent-ui-/.test(argv.join(' '))) return ok('/tmp/mdp\nDarwin\n')
+    if (argv[0] === 'osascript') return ok('yes\n')
+    return next(e)
+  })
+  const files: Record<string, string> = { '/h/.config/kitty/kitty.conf': 'font_family Iosevka\nbackground #101010\n' }
+  on('fs.exists', async ($: any, e: any, next: any) => (e.path.includes('kitty') ? { value: e.path in files } : next(e)))
+  on('fs.read', async ($: any, e: any, next: any) => (e.path in files ? { value: files[e.path] } : e.path.includes('kitty') ? ({ deny: 'no such file' } as any) : next(e)))
+  const ran = await $.command.run({ command: 'iui', args: 'details' } as any)
+  expect(ran.text).toContain('mode dark (auto, from kitty')
+  expect(ran.text).toContain('terminal font Iosevka')
+  expect(ran.text).not.toContain('IUI_')
+})
 
 // cmux (Ghostty inside) with no colours in the Ghostty config: its adaptive
 // default theme follows cmux's appearance; turned off, Ghostty's dark default.

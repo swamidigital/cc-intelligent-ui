@@ -1,8 +1,9 @@
-// Pictures under rows: the files Claude sends (SendUserFile) and the images
-// the user pastes are drawn under their row. An image is drawn at its own
-// size or smaller (a JPEG, WebP or SVG as the PNG Typst makes of it); a PDF
-// as one page, with a control line to turn the pages; a Markdown file as an
-// answer is. The pure parts are in images.ts.
+// Pictures under rows: the files Claude sends (SendUserFile) are drawn under
+// their row. An image is drawn at its own size or smaller (a JPEG, WebP or
+// SVG as the PNG Typst makes of it); a PDF as one page, with a control line
+// to turn the pages; a Markdown file as an answer is. The images the user
+// pastes are in composer.tsx (its folder, pasteDir, is here). The pure parts
+// are in images.ts.
 import type { EngineInterface, FsStat, ImageSource, RenderElement, RenderInput } from 'claude-code'
 
 import { COMPILE_TIMEOUT_MS, GUTTER, PICTURES_KEPT, SENT_TEXT_MAX_BYTES, type Height } from './settings'
@@ -11,7 +12,7 @@ import {
   type Env,
 } from './state'
 import { jobDone } from './epoch'
-import { fitBox, fitsInline, INLINE_MAX_BYTES, roomColumns } from './terminal'
+import { fitBox, fitsInline, INLINE_MAX_BYTES, isFlipHere, roomColumns } from './terminal'
 import {
   convertBox, convertedPath, factsAfter, folderOf, isNoPageError, lastKnownPage, NO_FACTS, onScreenOf, pageControls, pageOf, parsePage, pasteDirOf, pictureCells,
   pictureRowsFor, type PdfFacts, type PixelBox, type SentFile,
@@ -19,10 +20,11 @@ import {
 import { imagePathOf } from './markdown'
 import { drawPages, hashOf, linkRowsOf, linksFor, type ShownLink } from './draw'
 import { convertCall, logDebug, parseOd, pngSize } from './typst'
+import { flipFile } from './flip'
 import { pagesOf, type Drawing } from './answer'
-import { HEADERS_SH } from './host'
+import { HEADERS_SH, perlFor } from './host'
 import { frameFor, pictureColumns, shownFor, type Frame } from './frame'
-import { clockAfter, fsExists, fsList, fsRead, fsStat, fsWrite, processRun, sessionId, sessionRoot, uiClose, invalidate, uiOpen, uiResolve } from './api'
+import { delay, exists, ls, cat, stat, write, exec, sid, root, hide, redraw, show, uiResolve, nowMs } from './api'
 
 export type Picture = { file: string; stamp: string; bytes: number; width: number; height: number }
 export type Shown = { source: ImageSource; columns: number; rows: number; alt: string }
@@ -52,7 +54,7 @@ const STATS_KEPT = 4096
 let statsDone: number | undefined
 const stats = new Map<string, Promise<FsStat | null>>()
 function statOf($: EngineInterface, file: string, at?: StatAt): Promise<FsStat | null> {
-  if (!at) return fsStat($, file).catch(() => null)
+  if (!at) return stat($, file).catch(() => null)
   if (statsDone !== at.done || stats.size >= STATS_KEPT) {
     stats.clear()
     statsDone = at.done
@@ -60,7 +62,7 @@ function statOf($: EngineInterface, file: string, at?: StatAt): Promise<FsStat |
   const key = `${at.row}\n${file}`
   let got = stats.get(key)
   if (!got) {
-    got = fsStat($, file).catch(() => null)
+    got = stat($, file).catch(() => null)
     stats.set(key, got)
   }
   return got
@@ -74,7 +76,7 @@ export async function pictureOf($: EngineInterface, file: string, at?: StatAt): 
   const stamp = `${st.mtimeMs}:${st.size}`
   let kept = pictures.get(file)
   if (kept?.stamp !== stamp) {
-    const head = await processRun($, ['sh', '-c', HEADERS_SH, 'sh', file]).catch(() => null)
+    const head = await exec($, ['sh', '-c', HEADERS_SH, 'sh', file]).catch(() => null)
     if (!head || head.exitCode !== 0) return null
     kept = { stamp, size: pngSize(parseOd(head.stdout)[0] ?? []) }
     pictures.delete(file)
@@ -93,7 +95,7 @@ export async function pictureBytes($: EngineInterface, p: Picture): Promise<stri
   if (!fitsInline(p) || p.bytes > INLINE_MAX_BYTES) return null
   const key = `${p.file}@${p.stamp}`
   if (inlined.has(key)) return inlined.get(key) ?? null
-  const got = await fsRead($, p.file, { as: 'bytes' }).catch(() => null)
+  const got = await cat($, p.file, { as: 'bytes' }).catch(() => null)
   if (!got) return null
   const base64 = fitsInline(p, got.base64) ? got.base64 : null
   inlined.set(key, base64)
@@ -104,33 +106,75 @@ export async function pictureBytes($: EngineInterface, p: Picture): Promise<stri
   return base64
 }
 
-// The Images for the files that are PNGs, sized to the Frame on screen.
-// `at`: as statOf.
-export async function shownOf($: EngineInterface, e: RowInput, ready: Env, files: readonly string[], at?: StatAt): Promise<Shown[]> {
-  const shown: Shown[] = []
-  for (const file of new Set(files)) {
-    const s = await shownOne($, e, ready, file, nameOf(file), at)
-    if (s) shown.push(s)
-  }
-  return shown
-}
-
 // One PNG's Image, sized to the Frame and the height setting on screen
 // (shownFor, S.shownHeight: a new size shows when its epoch commits, with
 // every other picture), and at most as wide as the room now; null when it is not a PNG. `alt` is the file's name
 // (the name of the file it was made of). Its generation follows the file's
-// stat alone: a new box is not a new file.
+// stat alone: a new box is not a new file. In flip mode it draws the PNG
+// stored for its rows (flippedOf); null when that fails.
 export async function shownOne($: EngineInterface, e: RowInput, ready: Env, file: string, alt = nameOf(file), at?: StatAt): Promise<Shown | null> {
   const p = await pictureOf($, file, at)
   if (!p) return null
   const frame = shownFor(e.viewport)
   const fit = fitBox(pictureCells(p, pictureColumns(frame, false), pictureRowsFor(frame.rows, S.shownHeight), frame.cell), roomColumns(e.viewport))
+  const source = await sourceOf($, ready, p, fit.rows)
+  return source ? { source, ...fit, alt } : null
+}
+
+// A PNG's Image source: its bytes over ssh (null when too large), else its
+// file name, with a generation by its stat. In flip mode the PNG stored for
+// `rows` (flippedOf); null with no rows or when that fails.
+export async function sourceOf($: EngineInterface, ready: Env, p: Picture, rows?: number): Promise<ImageSource | null> {
   if (ready.inline) {
     const png = await pictureBytes($, p)
-    return png ? { source: { png }, ...fit, alt } : null
+    return png ? { png } : null
   }
-  const generation = Number.parseInt(hashOf([p.stamp]).slice(0, 8), 16)
-  return { source: { file, format: 'png', generation }, ...fit, alt }
+  if (isFlipHere(ready)) {
+    // Flip mode: only the PNG stored for the rows it is drawn in.
+    if (rows === undefined) return null
+    const flipped = await flippedOf($, ready, p, rows)
+    return flipped ? { file: flipped, format: 'png', generation: Number.parseInt(hashOf([p.stamp, rows]).slice(0, 8), 16) } : null
+  }
+  return { file: p.file, format: 'png', generation: Number.parseInt(hashOf([p.stamp]).slice(0, 8), 16) }
+}
+
+// Flip mode: a PNG stored for herdr in iTerm2 drawn `rows` rows tall
+// (flip.ts), in a key folder of the cache by the file, its stat stamp and
+// the rows; made once (one run per key), kept from an earlier load. Null
+// when it fails: not kept, but a key that failed runs again only after a
+// back-off (FLIP_RETRY_MS, doubled each failure up to FLIP_RETRY_MAX_MS).
+const flipped = new Map<string, Promise<string | null>>()
+const flipFailed = new Map<string, { at: number; wait: number }>()
+const FLIP_RETRY_MS = 5_000
+const FLIP_RETRY_MAX_MS = 60_000
+function flippedOf($: EngineInterface, ready: Env, p: Picture, rows: number): Promise<string | null> {
+  const key = `${p.file}@${p.stamp}@${rows}`
+  let got = flipped.get(key)
+  if (!got) {
+    const out = `${ready.cache}/${hashOf(['flip', p.file, p.stamp, rows])}/flip.png`
+    got = (async (): Promise<string | null> => {
+      const failed = flipFailed.get(key)
+      const now = () => nowMs($).catch(() => Date.now())
+      if (failed && (await now()) < failed.at) {
+        if (flipped.get(key) === got) flipped.delete(key)
+        return null
+      }
+      const made = await stat($, out).catch(() => null)
+      if (made?.kind === 'file' && made.size) return out
+      const ok = await flipFile($, { src: p.file, out, rows, isPage: false, perl: perlFor(ready.isMac) })
+      if (ok) {
+        flipFailed.delete(key)
+        return out
+      }
+      const wait = failed ? Math.min(FLIP_RETRY_MAX_MS, failed.wait * 2) : FLIP_RETRY_MS
+      keep(flipFailed, key, { at: (await now()) + wait, wait }, PICTURES_KEPT)
+      if (flipped.get(key) === got) flipped.delete(key)
+      await logDebug($, ready.cache, `could not store ${p.file} for herdr in iTerm2 (next try in ${wait / 1000} s)`)
+      return null
+    })()
+    keep(flipped, key, got, PICTURES_KEPT)
+  }
+  return got
 }
 
 const nameOf = (file: string) => file.split('/').pop() || 'image'
@@ -165,7 +209,7 @@ export async function convertedOf($: EngineInterface, ready: Env, file: string, 
     // jobDone one tick later: a run that ends while this row still draws
     // must not be lost. A run that is waited for (the first PNG, no epoch
     // open) draws in this render.
-    if (before || epochOpen()) void run.then(() => void clockAfter($, 0, () => jobDone($)), () => undefined)
+    if (before || epochOpen()) void run.then(() => void delay($, 0, () => jobDone($)), () => undefined)
   }
   return before ?? run
 }
@@ -210,20 +254,21 @@ async function convertOnce($: EngineInterface, ready: Env, file: string, stamp: 
   // The Typst error of a run that failed (null: made).
   let error: string | null = null
   // Made before (an earlier load): the same file, stamp and box.
-  const made = await fsStat($, out).catch(() => null)
+  const made = await stat($, out).catch(() => null)
   let png: string | null = out
   if (made?.kind !== 'file' || !made.size) {
     const dir = out.replace(/\/[^/]*$/, '')
     // The write makes the key folder; Typst does not (a failed write fails
     // the run below).
-    await fsWrite($, `${dir}/source.txt`, `${file}\n`).catch(() => undefined)
+    await write($, `${dir}/source.txt`, `${file}\n`).catch(() => undefined)
     // Typst writes a part file, moved to image.png only once it is whole, so
     // a run that is killed or fails leaves no image.png for a later load.
-    const part = `${dir}/image.part.png`
+    // Its own name per run: another session or load may convert the same key at once.
+    const part = `${dir}/image-${Math.random().toString(36).slice(2, 10)}.part.png`
     const { argv, env } = convertCall({ typst: ready.typst!, root: ready.root, cache: ready.cache, file, box, out: part, page: pdf?.page })
     const failed = (err: unknown) => ({ exitCode: 1, stdout: '', stderr: `did not run: ${String(err)}` })
-    const ran = await processRun($, argv, { timeoutMs: COMPILE_TIMEOUT_MS, env }).catch(failed)
-    const moved = ran.exitCode === 0 ? await processRun($, ['mv', '-f', part, out]).catch(failed) : null
+    const ran = await exec($, argv, { timeoutMs: COMPILE_TIMEOUT_MS, env }).catch(failed)
+    const moved = ran.exitCode === 0 ? await exec($, ['mv', '-f', part, out]).catch(failed) : null
     if (ran.exitCode !== 0) {
       // A PDF's page that is not there is no failure: it tells the last page.
       if (!pdf || !isNoPageError(ran.stderr)) await logDebug($, ready.cache, `convert ${file} failed:\n${ran.stderr}`)
@@ -249,7 +294,7 @@ export async function sentTextOf($: EngineInterface, file: string, at?: StatAt):
   const stamp = `${st.mtimeMs}:${st.size}`
   const kept = sentTexts.get(file)
   if (kept?.stamp === stamp) return kept.text
-  const got = st.size <= SENT_TEXT_MAX_BYTES ? await fsRead($, file).catch(() => null) : null
+  const got = st.size <= SENT_TEXT_MAX_BYTES ? await cat($, file).catch(() => null) : null
   const text = got?.trim() ? got : null
   keep(sentTexts, file, { stamp, text }, PICTURES_KEPT)
   return text
@@ -271,6 +316,8 @@ export async function sentOf(
   const target = epochOpen() ? frameFor(e.viewport) : null
   const box = boxOf(shown, o.ready.inline, S.shownHeight)
   const next = target ? boxOf(target, o.ready.inline, S.height) : null
+  // Flip mode: a PNG too is made by Typst at its box first (as shownOf).
+  const flip = isFlipHere(o.ready)
   const under: Under[] = []
   for (const f of o.files) {
     const full = imagePathOf(f.path, o.ready.cwd)
@@ -291,11 +338,11 @@ export async function sentOf(
       if (u) under.push(u)
       continue
     }
-    if (f.kind !== 'png' && next && (next.width !== box.width || next.height !== box.height)) {
+    if ((f.kind !== 'png' || flip) && next && (next.width !== box.width || next.height !== box.height)) {
       void convertedOf($, o.ready, full, next, o.at).catch(() => null)
       if (!(await hasPngOf($, full, o.at))) continue
     }
-    const png = f.kind === 'png' ? full : await convertedOf($, o.ready, full, box, o.at)
+    const png = f.kind === 'png' && !flip ? full : ((await convertedOf($, o.ready, full, box, o.at)) ?? (f.kind === 'png' ? full : null))
     const picture = png ? await shownOne($, e, o.ready, png, nameOf(full), o.at) : null
     if (picture) under.push(picture)
   }
@@ -374,7 +421,7 @@ async function pdfOf(
 // string: Typst's error for another failure; null when it is not known (no
 // Typst, a file that is gone).
 async function pageMade($: EngineInterface, ready: Env, file: string, row: string, page: number, box: PixelBox): Promise<boolean | string | null> {
-  const st = await fsStat($, file).catch(() => null)
+  const st = await stat($, file).catch(() => null)
   if (!ready.typst || !st || st.kind !== 'file') return null
   const stamp = `${st.mtimeMs}:${st.size}`
   const known = factsOf(file, stamp)
@@ -406,9 +453,9 @@ const PAGE_PANE = 'iui-page'
 // A press on the page number: the page field, with the page in it.
 async function askPage($: EngineInterface, line: PageLine) {
   pageAsk.now = { row: line.row, file: line.file, box: line.box, value: String(line.page), note: '' }
-  await uiOpen($, { id: PAGE_PANE, title: 'Page', focus: true, closeOnEscape: true, rows: 2, columns: 24 }).catch(() => undefined)
+  await show($, { id: PAGE_PANE, title: 'Page', focus: true, closeOnEscape: true, rows: 2, columns: 24 }).catch(() => undefined)
   // An open field (another row's) draws the new page.
-  invalidate($, 'ui.render')
+  redraw($, 'ui.render')
 }
 
 // Enter in the page field: a page that exists shows in its row and the
@@ -417,7 +464,7 @@ async function askPage($: EngineInterface, line: PageLine) {
 // later Enter makes an earlier one's result go unused.
 async function submitPage($: EngineInterface, text: string) {
   const ask = pageAsk.now
-  if (!ask) return void uiClose($, { id: PAGE_PANE }).catch(() => undefined)
+  if (!ask) return void hide($, { id: PAGE_PANE }).catch(() => undefined)
   const mine = { ...ask, value: text }
   pageAsk.now = mine
   const page = parsePage(text)
@@ -426,12 +473,12 @@ async function submitPage($: EngineInterface, text: string) {
   if (!page || made !== true) {
     const note = !page ? 'Type a page number' : made === false ? `No page ${page}` : `Page ${page}: ${made ?? 'Typst could not make it'}`
     pageAsk.now = { ...mine, note }
-    invalidate($, 'ui.render')
+    redraw($, 'ui.render')
     return
   }
   keep(pdfPages, ask.row, page, PICTURES_KEPT)
   pageAsk.now = null
-  await uiClose($, { id: PAGE_PANE }).catch(() => undefined)
+  await hide($, { id: PAGE_PANE }).catch(() => undefined)
   refresh($)
 }
 
@@ -548,20 +595,20 @@ export function underRow($: EngineInterface, e: RowInput, row: RenderElement, un
 // cwd's folder name is cut). Kept once found; '' while there is none.
 export async function pasteDir($: EngineInterface, ready: Env): Promise<string> {
   if (!ready.claudeTmp) return ''
-  const id = await sessionId($)
+  const id = await sid($)
   const kept = pasteDirs.get(id)
   if (kept) return kept
   const found = async (dirs: Iterable<string>) => {
     for (const dir of dirs) {
-      if (!(await fsExists($, dir).catch(() => false))) continue
+      if (!(await exists($, dir).catch(() => false))) continue
       pasteDirs.set(id, dir)
       return dir
     }
     return ''
   }
-  const root = await sessionRoot($).catch(() => ready.cwd)
-  const named = await found(new Set([ready.cwd, root].map(dir => pasteDirOf(ready.claudeTmp, dir, id))))
+  const top = await root($).catch(() => ready.cwd)
+  const named = await found(new Set([ready.cwd, top].map(dir => pasteDirOf(ready.claudeTmp, dir, id))))
   if (named) return named
-  const projects = (await fsList($, ready.claudeTmp).catch(() => [])).filter(f => f.kind === 'dir')
+  const projects = (await ls($, ready.claudeTmp).catch(() => [])).filter(f => f.kind === 'dir')
   return found(projects.map(f => `${ready.claudeTmp}/${f.name}/${id}/images`))
 }

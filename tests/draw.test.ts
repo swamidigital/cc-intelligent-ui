@@ -1,12 +1,12 @@
 import { expect, mock, test } from 'claude-code/testing'
 
 import {
-  alignFirstLine, scaledBulletRow, base64Bytes, canDrawIn, COMMIT_MIN_MS, DEFAULT_CELL, fileHref, fitsInline, INLINE_MAX_BYTES, INLINE_MAX_SIDE, inlineBudget, renderKey,
-  RESIZE_QUIET_MS, resolveLinks, SEGMENT_ROWS, WATCH_PL,
+  alignFirstLine, scaledBulletRow, base64Bytes, canDrawIn, COMMIT_MIN_MS, DEFAULT_CELL, fileHref, fitsInline, herdrBudget, HERDR_MAX_PAGE_BYTES, INLINE_MAX_BYTES,
+  INLINE_MAX_SIDE, inlineBudget, inlineOf, renderKey, RESIZE_QUIET_MS, resolveLinks, SEGMENT_ROWS, segmentBudget, sizing, WATCH_PL,
 } from '../hooks/register'
 import { TABLE_GRID } from './table-fixture'
 // This file's own copy of the drawing code, called with a fake `$`.
-import { drawPages, linksFor } from '../hooks/lib/draw'
+import { drawLinks, drawPages, linksFor } from '../hooks/lib/draw'
 
 // ---- Where pictures draw ----------------------------------------------------
 
@@ -19,9 +19,21 @@ test('tmux and screen draw no pictures, even with the engine forced; only IUI_FO
   expect(canDrawIn({ ...base, tmux: true, modForced: true })).toBe(true)
 })
 
-test('a background session never draws pictures, not even with IUI_FORCE', () => {
+test('a background session draws pictures only with IUI_FORCE and CLAUDE_CODE_FORCE_TERMINAL_IMAGES, also with tmux in its TERM', () => {
   expect(canDrawIn({ ...base, program: 'ghostty', background: true })).toBe(false)
-  expect(canDrawIn({ ...base, term: 'xterm-kitty', background: true, engineForced: true, modForced: true })).toBe(false)
+  expect(canDrawIn({ ...base, term: 'xterm-kitty', background: true, engineForced: true })).toBe(false)
+  expect(canDrawIn({ ...base, term: 'xterm-kitty', kitty: true, background: true, modForced: true })).toBe(false)
+  expect(canDrawIn({ ...base, background: true, modForced: true, engineForced: true })).toBe(true)
+  expect(canDrawIn({ ...base, term: 'tmux-256color', tmux: true, background: true, modForced: true, engineForced: true })).toBe(true)
+})
+
+test('pictures go as bytes over ssh, or as IUI_INLINE says when it is set', () => {
+  expect(inlineOf(false, undefined)).toBe(false)
+  expect(inlineOf(true, undefined)).toBe(true)
+  expect(inlineOf(true, '')).toBe(true)
+  expect(inlineOf(false, '1')).toBe(true)
+  expect(inlineOf(true, '0')).toBe(false)
+  expect(inlineOf(true, 'off')).toBe(false)
 })
 
 test('over ssh, TERM tells: kitty or Ghostty draws, an unknown terminal only when forced', () => {
@@ -55,6 +67,53 @@ test('over ssh a segment is cut so its page stays under 4096 px tall', () => {
   expect(inlineBudget({ width: 8, height: 16 })).toBe(SEGMENT_ROWS)
   expect(inlineBudget({ width: 40, height: 200 })).toBe(20)
   expect(inlineBudget(DEFAULT_CELL) * DEFAULT_CELL.height).toBeLessThan(INLINE_MAX_SIDE)
+})
+
+test('under herdr a segment is cut so its page stays under 16 MiB of RGBA', () => {
+  // The page is as wide as its columns in device pixels (sizing).
+  expect(sizing(187, { width: 16, height: 34 }, 6).widthPx).toBe(2992)
+  // A wide page on a Retina screen: 41 rows fit, 30 with the room for the rough count.
+  expect(herdrBudget(187, { width: 16, height: 34 })).toBe(30)
+  expect(herdrBudget(187, { width: 16, height: 34 }) * 34 * 2992 * 4 / 0.75).toBeLessThanOrEqual(HERDR_MAX_PAGE_BYTES)
+  // A small page keeps the normal budget; a large one at least 20 rows, when 20 rows fit.
+  expect(herdrBudget(80, { width: 8, height: 16 })).toBe(SEGMENT_ROWS)
+  expect(herdrBudget(255, { width: 20, height: 40 })).toBe(20)
+  // A huge cell: 20 rows would be 65 MiB (herdr sends none of it), so only the rows that fit.
+  expect(herdrBudget(255, { width: 40, height: 80 })).toBe(5)
+  expect(herdrBudget(255, { width: 400, height: 800 })).toBe(1)
+  // The budget never passes HERDR_MAX_PAGE_BYTES (a row of 16 MiB or more: 1 row).
+  for (const columns of [20, 80, 187, 255]) {
+    for (const width of [7, 16, 24, 32, 40, 60]) {
+      const px = { width, height: width * 2 }
+      const row = 4 * Math.round(columns * px.width) * px.height
+      if (row <= HERDR_MAX_PAGE_BYTES) expect(herdrBudget(columns, px) * row).toBeLessThanOrEqual(HERDR_MAX_PAGE_BYTES)
+    }
+  }
+  // The cell width counts as sizing rounds it.
+  expect(herdrBudget(100, { width: 15.5, height: 30 })).toBe(Math.floor((HERDR_MAX_PAGE_BYTES / (4 * 1550 * 30)) * 0.75))
+})
+
+test('the segment budget: the smaller of the ssh and herdr ones that apply', () => {
+  const big = { width: 16, height: 34 }
+  expect(segmentBudget({ inline: false }, 187, big)).toBe(SEGMENT_ROWS)
+  expect(segmentBudget({ inline: false, herdr: false }, 187, big)).toBe(SEGMENT_ROWS)
+  expect(segmentBudget({ inline: false, herdr: true }, 187, big)).toBe(herdrBudget(187, big))
+  expect(segmentBudget({ inline: true }, 187, big)).toBe(inlineBudget(big))
+  // Over ssh into herdr: the herdr budget (30) is under the ssh one (90).
+  expect(inlineBudget(big)).toBe(90)
+  expect(segmentBudget({ inline: true, herdr: true }, 187, big)).toBe(30)
+  // A narrow page: the ssh budget is the smaller one.
+  expect(segmentBudget({ inline: true, herdr: true }, 40, big)).toBe(inlineBudget(big))
+})
+
+test('pages cut for herdr have keys of their own; other keys do not change', () => {
+  const o = {
+    textHash: 'h', columns: 100, cell: DEFAULT_CELL, size: 100, mode: 'dark' as const, termFont: '', columnPt: 6,
+    templateStamp: '1', look: { name: 'vscode', dir: '/t', stamp: '0' },
+  }
+  expect(renderKey({ ...o, herdr: false })).toBe(renderKey(o))
+  expect(renderKey({ ...o, herdr: true })).not.toBe(renderKey(o))
+  expect(renderKey({ ...o, herdr: true })).not.toBe(renderKey({ ...o, inline: true }))
 })
 
 test('pages cut for ssh have keys of their own; local keys do not change', () => {
@@ -220,6 +279,8 @@ function world(on: any, vars: Record<string, string>, head = HEAD, stored: Recor
   })
   on('fs.stat', async ($: any, e: any, next: any) => {
     calls.push('fs.stat')
+    // The project's files (the link rows' paths): the ones written.
+    if (e.path.startsWith('/w/app/')) return files.has(e.path) ? { value: { kind: 'file', size: 1, mtimeMs: 1, isLink: false } } : { deny: 'ENOENT' }
     return next(e)
   })
   const toasts: string[] = []
@@ -237,6 +298,16 @@ const message = (requestId: string, text: string) =>
 const props = (text: string) => ({ text, isFirstOfReply: true }) as any
 const images = (tree: any): any[] =>
   tree && typeof tree === 'object' ? [...(tree.type === 'Image' ? [tree] : []), ...(tree.children ?? []).flatMap(images)] : []
+
+test('in a background session with IUI_FORCE, CLAUDE_CODE_FORCE_TERMINAL_IMAGES and IUI_INLINE, a page goes as PNG bytes', async ($, on) => {
+  const { clock } = world(on, { CLAUDE_CODE_SESSION_KIND: 'bg', TERM: 'tmux-256color', IUI_FORCE: '1', CLAUDE_CODE_FORCE_TERMINAL_IMAGES: '1', IUI_INLINE: '1' })
+  const ran = await $.command.run({ command: 'iui', args: 'details' } as any)
+  expect(ran.text).toContain('sent as bytes: IUI_INLINE')
+  const ui = await $.ui.mount(message('bg-1', 'Some **bold** text.'))
+  await clock.settle()
+  await ui.redraw(props('Some **bold** text.'))
+  expect(images(await ui.drawn())[0].props.source).toEqual({ png: PNG })
+})
 
 test('over ssh in kitty, a page goes as PNG bytes, read once', async ($, on) => {
   const { clock, reads } = world(on, { SSH_CONNECTION: '10.0.0.2 50000 10.0.0.1 22', TERM: 'xterm-kitty' })
@@ -333,7 +404,7 @@ const bulletRowOf = (tree: any) => boxes(tree).find(b => b.props.width === 2)?.p
 test('grid on is kept and begins an epoch: another key, compiled with grid=1 and top=0; grid off goes back to the key of before', async ($, on) => {
   const { clock, kept, compiles, logs } = world(on, { TERM: 'xterm-kitty', IUI_DEBUG: '1' }, HEAD, { grid: false })
   const ran = await $.command.run({ command: 'iui', args: '' } as any)
-  expect(ran.text).toContain('grid off.')
+  expect(ran.text).toContain('grid off, editor auto.')
   const ui = await $.ui.mount(message('g-1', 'Some **bold** text.'))
   await clock.settle()
   await ui.redraw(props('Some **bold** text.'))
@@ -355,7 +426,7 @@ test('grid on is kept and begins an epoch: another key, compiled with grid=1 and
   expect(compiles[1]!.top).toBe('0')
   expect(now.props.source.file).not.toBe(first.props.source.file)
   const status = await $.command.run({ command: 'iui', args: '' } as any)
-  expect(status.text).toContain('grid on.')
+  expect(status.text).toContain('grid on, editor auto.')
   const details = await $.command.run({ command: 'iui', args: 'details' } as any)
   expect(details.text).toContain('row grid on')
   // Off: the key of before, in memory, so nothing compiles.
@@ -857,9 +928,20 @@ const all = (tree: any, type: string): any[] =>
   tree && typeof tree === 'object' ? [...(tree.type === type ? [tree] : []), ...(tree.children ?? []).flatMap((c: any) => all(c, type))] : []
 const textOf = (tree: any): string => (typeof tree === 'string' ? tree : (tree?.children ?? []).map(textOf).join(''))
 
+// A fake `$.fs.stat`: `kinds` the paths there (a kind, or 'link' a symbolic link to a file); others ENOENT.
+function statOf(kinds: Record<string, string>, asked: string[] = []) {
+  const stat = async (path: string) => {
+    asked.push(path)
+    const kind = kinds[path]
+    if (!kind) throw new Error('ENOENT')
+    return { kind: kind === 'link' ? 'file' : kind, size: 1, mtimeMs: 1, isLink: kind === 'link' }
+  }
+  return { fs: { stat } } as any
+}
+
 test('a file path is made absolute and kept only when it is a file; ~/ is the home folder; the href is encoded', async () => {
   const asked: string[] = []
-  const $ = { fs: { exists: async (path: string) => (asked.push(path), path !== '/w/app/gone.ts') } } as any
+  const $ = statOf({ '/w/app/src/a b.ts': 'file', '/h/x#1.md': 'file', '/abs/y.md': 'file' }, asked)
   const items = [
     { kind: 'web', label: 'Docs', href: 'https://typst.app/docs' },
     { kind: 'file', label: 'src/a b.ts:42', path: 'src/a b.ts' },
@@ -880,6 +962,23 @@ test('a file path is made absolute and kept only when it is a file; ~/ is the ho
   await resolveLinks($, items, '/w/app', '/h')
   expect(asked).toEqual(['/w/app/src/a b.ts', '/w/app/gone.ts', '/h/x#1.md', '/abs/y.md'])
   expect(fileHref('/a/b?c.md')).toBe('file:///a/b%3Fc.md')
+})
+
+test('a folder (an .app bundle, a folder named like a file) or a symbolic link is no file link', async () => {
+  const $ = statOf({ '/k/Tool.app': 'dir', '/k/docs.md': 'dir', '/k/pic.png': 'link', '/k/odd.png': 'other', '/k/ok.png': 'file' })
+  const items = ['Tool.app', 'docs.md', 'pic.png', 'odd.png', 'ok.png'].map(name => ({ kind: 'file', label: name, path: `/k/${name}` }) as const)
+  expect((await resolveLinks($, items, '/k', '/h')).map(l => l.label)).toEqual(['ok.png'])
+})
+
+test('a link row of a file a plain open could run has no file:// link; a picture or plain text has one', () => {
+  const $ = { ui: { resolve: () => ({ Box: 'Box', Text: 'Text', Link: 'Link', Button: 'Button' }) } } as any
+  const e = { viewport: { columns: 100, rows: 40 } } as any
+  const row = (name: string) => ({ kind: 'file', label: `[x](${name})`, path: `/k/${name}`, href: fileHref(`/k/${name}`) }) as const
+  const names = ['setup.command', 'run.tool', 'Go.terminal', 'a.webloc', 'a.fileloc', 'a.inetloc', 'x.jar', 'a.desktop', 'a.sh', 'a.py', 'a.html', 'shot.png', 'doc.pdf', 'notes.md', 'a.ts']
+  const rows: any[] = drawLinks($, e, names.map(row), '') as any
+  const hrefs = rows.flatMap(r => all(r, 'Link')).map(l => l.props.href)
+  expect(hrefs).toEqual(['file:///k/shot.png', 'file:///k/doc.pdf', 'file:///k/notes.md', 'file:///k/a.ts'])
+  expect(textOf(rows[0])).toBe('· [x](setup.command)')
 })
 
 const LINKED = [
@@ -950,7 +1049,7 @@ test('a press on a command row that cannot copy toasts the reason, or none', asy
 })
 
 test('the link rows of a text are none when a file check throws', async () => {
-  const $ = { fs: { exists: () => { throw new Error('gone') } } } as any
+  const $ = { fs: { stat: () => { throw new Error('gone') } } } as any
   expect(await linksFor($, 'See `src/never-checked.ts`.', '/w')).toEqual([])
 })
 

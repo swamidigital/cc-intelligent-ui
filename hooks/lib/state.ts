@@ -5,15 +5,16 @@ import type { EngineInterface } from 'claude-code'
 
 import type { IuiTheme } from '../../types'
 import type { ThemeInfo } from './themes'
-import type { HostMode, ThemeSetting } from './mode'
+import type { HostMode, Osc11Kept, ThemeSetting } from './mode'
 import type { PlanVerdict } from './plan'
 import type { Drawn } from './copy'
 import type { GridMetrics } from './grid'
 import type { Checked } from './updates'
 import type { ClipWay } from './clipboard'
 import type { PdfFacts, PixelBox } from './images'
+import type { HerdrClient, HerdrHost } from './terminal'
 import { DEFAULT_HEIGHT, DEFAULT_SIZE, DEFAULT_WIDTH, type Height, type Width } from './settings'
-import { invalidate } from './api'
+import { redraw } from './api'
 
 // The `done` atom (see types/index.d.ts) for refresh. The state scan of
 // `claude plugin validate` reads an atom only from a const in the file that
@@ -57,6 +58,8 @@ export type Env = {
   canDraw: boolean
   // Over ssh: pictures go as `{ png }` bytes, not as a file name.
   inline: boolean
+  // Under herdr: pages are cut smaller (herdrBudget), so herdr sends them.
+  herdr?: boolean
   cache: string
   cwd: string
   root: string
@@ -72,8 +75,8 @@ export type Env = {
   designs: string
 }
 // `columns` and `rows`: the cell box the page was compiled for (it is drawn
-// at that box, never stretched).
-export type Page = { file: string; width: number; height: number; alt: string; columns: number; rows: number }
+// at that box, never stretched). `flip`: stored for flip mode (flip.ts).
+export type Page = { file: string; width: number; height: number; alt: string; columns: number; rows: number; flip?: boolean }
 export type Result = { pages: Page[]; bulletRow: number; note?: string }
 export type Job = {
   key: string
@@ -91,6 +94,8 @@ export type Job = {
   base?: string
   // The room for its drawings (a text with a live Typst block or a local image).
   room?: Room
+  // Flip mode (herdr in iTerm2): its pages are stored flipped (flip.ts).
+  flip?: boolean
   // The epoch (S.epoch) it was enqueued in: only the open epoch's jobs hold
   // its commit (set by enqueue).
   epoch: number
@@ -156,6 +161,12 @@ export const S = {
   // Code's version ('' not known), read in setUp.
   select: true,
   engine: '',
+  // `/iui editor`: what a click on a file opens it in (open.ts: parseEditor),
+  // `auto` by default; the known editor `auto` found (null: not looked up
+  // yet; '': none); and the paths of programs on the PATH by name ('': none).
+  editor: 'auto',
+  autoEditor: null as string | null,
+  onPath: new Map<string, string>(),
   look: null as Look | null,
   // The usable themes the last scan found, for the typeahead.
   themeChoices: [] as ThemeInfo[],
@@ -171,11 +182,30 @@ export const S = {
   termProgram: '',
   termName: '',
   itermProfile: undefined as string | undefined,
-  // kitty: TERM=xterm-kitty, or its KITTY_WINDOW_ID / KITTY_PID (set in setUp).
+  // kitty: TERM=xterm-kitty, or its KITTY_WINDOW_ID / KITTY_PID (set in setUp; setOuter).
   isKitty: false,
-  // iTerm2 (isItermIn) and cmux (Ghostty inside, with its CMUX_* variables), set in setUp.
+  // iTerm2 (isItermIn) and cmux (Ghostty inside, with its CMUX_* variables), set in setUp (cmux: setOuter).
   isIterm: false,
   isCmux: false,
+  // herdr (isHerdrIn), its version ('' not known), the client in use
+  // (pickHerdrClient: in the terminal app in front, or typed in last; null:
+  // none found, so the server's variables count) and how it was chosen, the
+  // terminal it runs in ('' outside herdr or not known; setOuter), all set
+  // in setUp and kept by the poll; and the last OSC 11 answer of its pane
+  // (keptOsc11) and the probes still allowed (OSC11_TRIES: the start or a new client).
+  isHerdr: false,
+  herdrVersion: '',
+  herdrClient: null as HerdrClient | null,
+  herdrBy: 'typed' as 'front' | 'typed',
+  herdrHost: '' as HerdrHost,
+  // The clients, the app in front and the time of the last full scan (null: none yet), for the light check.
+  herdrClients: [] as HerdrClient[],
+  herdrScanFront: null as string | null,
+  herdrScanAt: null as number | null,
+  // Polls under herdr since the last mode read (it runs every HOST_POLL_MS).
+  hostTicks: 0,
+  osc11Kept: null as Osc11Kept,
+  osc11Tries: 0,
   // A font folder for Typst (TYPST_FONT_PATHS): the font a terminal carries
   // in its program (Ghostty's, Rio's), when it draws it. '' for none.
   fontPaths: '',
@@ -184,13 +214,25 @@ export const S = {
   // Over ssh (set in setUp): the terminal's config and the OS appearance here
   // are the remote computer's, not those of the user's screen.
   isRemote: false,
+  // The terminal font came from IUI_FONT (termFontOf).
+  fontByVar: false,
   // IUI_DEBUG is set (setUp): trace lines go to the debug log.
   debug: false,
-  // iTerm2 with the engine's pictures off at start: /iui setup can help
+  // iTerm2 or herdr with the engine's pictures off at start: /iui setup can help
   // (`setupNeeded`); the question is asked once per load (`setupAsked`).
   setupNeeded: false,
   setupAsked: false,
   watch: null as { cancel: () => void } | null,
+  // The poll timer's period (watchHost).
+  watchMs: 0,
+  // herdr's client check is of use: herdr, with pictures drawn (setUp), and
+  // the mod not turned off (/iui off, or off when it starts). The poll ends
+  // with the session (stopHost).
+  herdrDraws: false,
+  isOff: false,
+  hostEnded: false,
+  // The clock time of the last key in the prompt box (register.tsx; OSC11_QUIET_MS).
+  keyAt: Number.NEGATIVE_INFINITY,
   checking: false,
   // Linux: the tool that reads the desktop portal's colour scheme (host.ts;
   // null: not tried yet, '': none works, so GNOME's gsettings is read).
@@ -202,11 +244,14 @@ export const S = {
   stepsLive: 0,
   // The plan (plan.tsx): the main loop's running turn (`turn.start`), the
   // verdict the mod's question gave for the PermissionRequest that follows
-  // (null: none, the engine's dialog asks), the question asked now ('': none),
-  // and the `code` command's path (null: not looked up yet; '': none), and
-  // on Linux a GUI editor that waits (its path and flag; [] none).
+  // (null: none, the engine's dialog asks), the main loop's ExitPlanMode
+  // calls in flight (a verdict is used only while one runs), the question
+  // asked now ('': none), and the `code` command's path (null: not looked
+  // up yet; '': none), and on Linux a GUI editor that waits (its path and
+  // flag; [] none).
   mainTurnId: '',
   planVerdict: null as PlanVerdict | null,
+  plansLive: 0,
   planAsking: '',
   planCode: null as string | null,
   planGui: null as string[] | null,
@@ -222,17 +267,28 @@ export const S = {
   updatesLoading: null as Promise<void> | null,
   updateDone: false,
   updateBusy: false,
+  // The `[Image #N]` numbers last written to the `draft` atom (register.tsx;
+  // null: none written in this load).
+  draftImages: null as number[] | null,
 }
+// The settings an /iui command set in this load (`size`, `enabled`, ...): the
+// start (setUp) does not read them from the store, which may answer with the
+// value from before the command.
+export const settingsSet = new Set<string>()
 // The compile results by key (an LRU: set with `keep` at RESULTS_KEPT).
 export const results = new Map<string, Result | 'failed'>()
 // Streaming: model requests of the main loop in flight (`S.stepsLive`), the
-// blocks drawn blank while their text streams (with the job to compile once
-// final), and the blocks a request made final (they stay final).
+// text each block last drew, the blocks drawn blank while their text streams
+// (with the job to compile once final), and the blocks a request made final
+// (they stay final). The texts and the final ones go past RESULTS_KEPT, as
+// `results` (an id gone draws as one not seen yet).
 export const lastText = new Map<string, string>()
 export const live = new Map<string, { job: Job; still: { cancel: () => void } }>()
 export const finalized = new Set<string>()
 // A final block not drawn yet: blank until `showText` (its deadline passed).
 export const pending = new Map<string, { textHash: string; showText: boolean; timer: { cancel: () => void } }>()
+// Called once when the next compile ends, cancelled or not (the plan waits on it).
+export const jobEnds = new Set<() => void>()
 // The jobs waiting, and the jobs that compile now by key (with the cancel
 // of each: beginEpoch stops them; and its signal: an entry cancelled still
 // holds its slot until its compile ends, but its key may be enqueued again).
@@ -290,19 +346,22 @@ export const writesLive = new Map<string, number>()
 // probe's inputs; none when not known).
 export const drawnAnswers = new Map<string, Drawn & { job?: Job }>()
 export const DRAWN_KEPT = 64
+// The copy gate's hook for a mod copy no ui.copy hook sees (register.tsx sets it).
+export const ownCopy = { note: (_text: string) => {} }
+
 // The clipboard (register.tsx): the change count last seen (null: none
 // yet; the first of each watcher child is only noted), whether the watcher
 // found no PerlObjCBridge (`none`), a read that runs (`busy`) and a change
-// that came during it (`again`), the clipboard text last seen and last
-// written (so a write is never read back as new), the last text with
-// placeholders with its row (`rawRow`, when known) and how it was read (for
-// dump), and the order of the drawings (`seq`).
+// that came during it (`again`), the clipboard text last seen (null: none
+// could be read) and last written (so a write is never read back as new),
+// the last text with placeholders with its row (`rawRow`, when known) and
+// how it was read (for dump), and the order of the drawings (`seq`).
 export const clip = {
   count: null as number | null,
   none: false,
   busy: false,
   again: false,
-  seen: '',
+  seen: '' as string | null,
   wrote: '',
   raw: '',
   rawRow: undefined as string | undefined,
@@ -325,7 +384,17 @@ export function keep<T>(cache: Map<string, T>, key: string, value: T, max: numbe
   }
 }
 
+// The same for a set: `key` as the newest; the oldest go past `max`.
+export function keepIn(set: Set<string>, key: string, max: number) {
+  set.delete(key)
+  set.add(key)
+  for (const old of set) {
+    if (set.size <= max) break
+    set.delete(old)
+  }
+}
+
 // Redraws every reader of `done`; an invalidate where the write is refused.
 export function refresh($: EngineInterface) {
-  void update($, done, n => n + 1).catch(() => invalidate($, 'ui.render'))
+  void update($, done, n => n + 1).catch(() => redraw($, 'ui.render'))
 }

@@ -16,7 +16,7 @@ import { columnsFor, isGhosttyHere, sizeOf } from './terminal'
 import { CELL_SH, perlFor, termFontOf, WATCH_PL } from './host'
 import { clipWatchArgs } from './clipboard'
 import { measureFonts } from './typst'
-import { clockAfter, processRun, spawn } from './api'
+import { delay, exec, spawn } from './api'
 
 export type { Cell, Frame } from './state'
 
@@ -97,7 +97,7 @@ const viewNow = (): View | null => (S.viewColumns === null ? null : { columns: S
 // One read of the tty size as a Frame; null when it fails (no tty, no
 // pixels).
 export async function readFrame($: EngineInterface): Promise<Frame | null> {
-  const tty = await processRun($, ['sh', '-c', CELL_SH], { timeoutMs: 5000 }).catch(() => null)
+  const tty = await exec($, ['sh', '-c', CELL_SH], { timeoutMs: 5000 }).catch(() => null)
   return tty?.exitCode === 0 ? frameOfLine(tty.stdout) : null
 }
 
@@ -140,7 +140,7 @@ let poke: (() => void) | null = null
 function burst($: EngineInterface) {
   poke ??= quietTimer({
     ms: RESIZE_QUIET_MS,
-    after: (ms, fn) => clockAfter($, ms, fn),
+    after: (ms, fn) => delay($, ms, fn),
     onStart: holdJobs,
     onQuiet: stale => void settle($, stale),
   })
@@ -237,12 +237,13 @@ export function watchFrame($: EngineInterface, clip?: ((count: number | null, fi
   }
   if (!watcher && clip !== undefined && !isClip) return false
   watcher?.stop()
-  // The stop: a kill once its PID is known (its first line).
+  // The stop: a kill once its PID is known (its first line), and not after
+  // the child ended (its PID can be another process's by then).
   let pid = ''
   let stopped = false
   let counted = false
   const kill = () => {
-    if (stopped && pid) void Promise.resolve(processRun($, ['kill', pid], { timeoutMs: 5000 })).catch(() => undefined)
+    if (stopped && pid && !me.ended) void Promise.resolve(exec($, ['kill', pid], { timeoutMs: 5000 })).catch(() => undefined)
   }
   const stop = () => {
     if (stopped) return
@@ -271,7 +272,7 @@ export function watchFrame($: EngineInterface, clip?: ((count: number | null, fi
       // WATCH_RESTART_MS, while it is still the child now.
       if (stopped || me.final || !me.clip) return
       try {
-        clockAfter($, WATCH_RESTART_MS, () => {
+        delay($, WATCH_RESTART_MS, () => {
           if (watcher === me) watchFrame($)
         })
       } catch {}
@@ -319,6 +320,15 @@ export async function followWatcher(
 // time; a change while it runs reads once more.
 let fonting: Promise<boolean> | null = null
 let fontAgain = false
+let refontAtStart = false
+
+// The end of setUp: a refont asked while it ran reads the font again now
+// (a new epoch when it changed).
+export function refontAfterStart($: EngineInterface) {
+  if (!refontAtStart) return
+  refontAtStart = false
+  void refont($).then(changed => void (changed && beginEpoch($)), () => undefined)
+}
 export function refont($: EngineInterface): Promise<boolean> {
   if (fonting) {
     fontAgain = true
@@ -329,10 +339,19 @@ export function refont($: EngineInterface): Promise<boolean> {
     do {
       fontAgain = false
       const env = S.env
-      if (!env) return changed
+      // Before the start is done (its font may be the old one): setUp reads again.
+      if (!env) {
+        refontAtStart = true
+        return changed
+      }
       const termFont = (await termFontOf($, env.isMac).catch(() => '')) || env.termFont
       const themeDir = S.look?.dir ?? `${env.root}/render/themes/${BASE_THEME}`
       const read = env.typst ? await measureFonts($, env.typst, env.root, env.cache, termFont, themeDir).catch(() => DEFAULT_METRICS) : env.metrics
+      // A theme set meanwhile (/iui theme): its fonts are measured again, never an older theme's written.
+      if ((S.look?.dir ?? `${env.root}/render/themes/${BASE_THEME}`) !== themeDir) {
+        fontAgain = true
+        continue
+      }
       const metrics = read === DEFAULT_METRICS ? env.metrics : read
       if (termFont === env.termFont && sameMetrics(metrics, env.metrics)) continue
       env.termFont = termFont

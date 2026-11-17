@@ -13,6 +13,7 @@ import {
   firstLine, gridText, heightText, isTypstInfo, widthText,
 } from '../hooks/register'
 import { DRAWING_ROWS } from '../hooks/lib/settings'
+import { seamsOf } from '../hooks/lib/markdown'
 import { noNetworkEnv, wrapPid } from '../hooks/lib/typst'
 import { S, type Env, type Job } from '../hooks/lib/state'
 import { placeFirstLine } from '../hooks/lib/draw'
@@ -112,6 +113,41 @@ test('footnotes keep the answer in one segment; link definitions go to every seg
   const segments = splitSegments(`${long}\n\n[docs]: https://example.com`, 80)
   expect(segments.length).toBeGreaterThan(1)
   for (const s of segments) expect(s.includes('[docs]: https://example.com')).toBe(true)
+})
+
+test('a seam is the block above a break and the block below it', () => {
+  expect(seamsOf(['# T\n\nA paragraph.', '- a\n- b\n\nAfter.'])).toEqual([null, ['A paragraph.', '- a\n- b']])
+  expect(seamsOf(['One segment.'])).toEqual([null])
+  expect(seamsOf(['', 'Text.'])).toEqual([null, null])
+  // A fence is a short one of its kind, a typst fence has no code.
+  expect(seamsOf([fence('python', 50), '```typst\n#rect()\n```', 'End.'])).toEqual([null, ['```python\nx\n```', '```typst\n```'], ['```typst\n```', 'End.']])
+  // Link definitions are no block.
+  expect(seamsOf(['Text.\n\n[d]: https://e.com', 'More.\n\n[d]: https://e.com'])).toEqual([null, ['Text.', 'More.']])
+})
+
+test('two lists at a break: the seam is the first lines of the items that meet (one loose list in one flow)', () => {
+  const loose = ['1. **Install** the tool\n   - run the script\n   - check the path', '2. **Configure** it\n   - edit the file', '3. **Run** it']
+  expect(seamsOf(loose)).toEqual([null, ['1. **Install** the tool', '2. **Configure** it'], ['2. **Configure** it', '3. **Run** it']])
+  expect(seamsOf(['- a\n- b\n- c\n- d', '- e'])).toEqual([null, ['- d', '- e']])
+  // A list and a paragraph: the blocks as they are.
+  expect(seamsOf(['- a\n- b', 'After.'])).toEqual([null, ['- a\n- b', 'After.']])
+  // An item that starts a fence or math: the blocks as they are.
+  expect(seamsOf(['- a\n- ```sh\n  x\n  ```', '- b'])).toEqual([null, ['- a\n- ```sh\n  x\n  ```', '- b']])
+})
+
+test('the seams of a split answer are the blocks that meet at its breaks', () => {
+  const md = Array.from({ length: 120 }, (_, i) => (i % 3 ? para(i) : `- item ${i}\n- more ${i}`)).join('\n\n')
+  const segments = splitSegments(md, 80, 30)
+  const seams = seamsOf(segments)
+  expect(segments.length).toBeGreaterThan(2)
+  expect(seams[0]).toBeNull()
+  for (const [i, seam] of seams.entries()) {
+    if (!i) continue
+    expect(segments[i - 1]!.endsWith(seam![0])).toBe(true)
+    expect(segments[i]!.startsWith(seam![1])).toBe(true)
+    // In the text the two blocks meet as they are.
+    expect(md.includes(`${seam![0]}\n\n${seam![1]}`)).toBe(true)
+  }
 })
 
 test('the hash is stable and tells inputs apart', () => {
@@ -460,7 +496,7 @@ test('the terminal font is read from iTerm2 and Ghostty settings', () => {
 })
 
 test('typst also reads the font folder of the font that Ghostty carries, when there is one', () => {
-  const call = () => typstCall({ typst: 't', root: '/mod', cache: '/tmp/c', ppi: 144, inputs: {}, out: '/tmp/o.png' })
+  const call = () => typstCall({ typst: 't', root: '/mod', run: '/tmp/c/k/r-1', cache: '/tmp/c', ppi: 144, inputs: {}, out: '/tmp/o.png' })
   expect(call().env.TYPST_FONT_PATHS).toBe(undefined)
   S.fontPaths = '/home/u/.cache/cc-intelligent-ui/fonts/ghostty-1'
   try {
@@ -472,7 +508,7 @@ test('typst also reads the font folder of the font that Ghostty carries, when th
 
 test('typst runs with the network off and its own package cache', () => {
   const { argv, env } = typstCall({
-    typst: '/opt/homebrew/bin/typst', root: '/mod', cache: '/tmp/c', ppi: 210.5,
+    typst: '/opt/homebrew/bin/typst', root: '/mod', run: '/tmp/c/k/r-1', cache: '/tmp/c', ppi: 210.5,
     inputs: { theme: 'dark', width: 698.4, 'term-font': 'MesloLGS NF', doc: '/tmp/c/k/doc.json' },
     out: '/tmp/c/k/a-{0p}.png',
   })
@@ -481,7 +517,9 @@ test('typst runs with the network off and its own package cache', () => {
   expect(argv[argv.indexOf('--package-path') + 1]).toBe('/mod/render/packages')
   expect(argv[argv.indexOf('--ppi') + 1]).toBe('210.5000')
   expect(argv.includes('term-font=MesloLGS NF')).toBe(true)
-  expect(argv.slice(-2)).toEqual(['/mod/render/md.typ', '/tmp/c/k/a-{0p}.png'])
+  // The root is the run folder; the template is its copy there.
+  expect(argv[argv.indexOf('--root') + 1]).toBe('/tmp/c/k/r-1')
+  expect(argv.slice(-2)).toEqual(['/tmp/c/k/r-1/mod/render/md.typ', '/tmp/c/k/a-{0p}.png'])
   expect(env.HTTPS_PROXY).toBe('http://127.0.0.1:9')
   expect(env.HTTP_PROXY).toBe('http://127.0.0.1:9')
   expect(env.ALL_PROXY).toBe('http://127.0.0.1:9')

@@ -6,18 +6,19 @@ import type { EngineInterface, RenderComponent, RenderSurface, RenderViewport, R
 
 import type { IuiTheme } from '../../types'
 import { BODY_PT, bulletOf, GRID_VERSION, GUTTER, LINK_FILES_KEPT, MARGIN_TOP, RESULTS_KEPT, TEMPLATE_VERSION } from './settings'
-import { INLINE_KEPT, inlined, keep, linkFiles, S, type Cell, type Look, type Metrics, type Result, type Room } from './state'
+import { INLINE_KEPT, inlined, keep, linkFiles, ownCopy, S, type Cell, type Look, type Metrics, type Result, type Room } from './state'
 import { DEFAULT_GRID, gridFirstRow, type GridMetrics } from './grid'
 import { FENCE, imagePathOf } from './markdown'
 import { linksOf, type LinkItem } from './links'
+import { opensPlain } from './open'
 import { fitBox, fitsInline, roomColumns } from './terminal'
 import { clickLinks, selectOn } from './select'
 import { noteSite } from './blit'
-import { fsExists, fsRead, uiCopy, uiResolve, uiToast } from './api'
+import { stat, cat, copy, uiResolve, toast } from './api'
 
 // FNV-1a over the parts, twice with different offsets: 16 hex digits.
 export function hashOf(parts: readonly (string | number)[]): string {
-  const s = parts.join('\u0000')
+  const s = parts.join('\u241f')
   let a = 0x811c9dc5
   let b = 0x050c5d1f
   for (let i = 0; i < s.length; i++) {
@@ -69,6 +70,10 @@ export function renderKey(o: {
   look: Look
   // Over ssh: pages are cut shorter (inlineBudget), so they are other PNGs.
   inline?: boolean
+  // Under herdr: pages are cut shorter too (herdrBudget).
+  herdr?: boolean
+  // Flip mode (herdr in iTerm2): pages stored with their bands moved (flip.ts).
+  flip?: boolean
   // The folder relative images start from, when it is not the session's (a
   // Markdown file's): the same text there shows other images.
   base?: string
@@ -85,7 +90,8 @@ export function renderKey(o: {
   const { room } = o
   return hashOf([
     o.textHash, o.columns, o.cell.width, o.cell.height, o.size, o.mode, o.termFont, o.columnPt,
-    o.templateStamp, o.look.name, o.look.dir, o.look.stamp, TEMPLATE_VERSION, ...(o.inline ? ['inline'] : []),
+    o.templateStamp, o.look.name, o.look.dir, o.look.stamp, TEMPLATE_VERSION, ...(o.inline ? ['inline'] : []), ...(o.herdr ? ['herdr'] : []),
+    ...(o.flip ? ['flip'] : []),
     ...(o.base ? ['base', o.base] : []),
     ...(room ? ['room', room.heightPt, room.design.widthPt, room.design.heightPt] : []),
     ...(o.grid ? ['grid', GRID_VERSION] : []),
@@ -162,7 +168,7 @@ export async function inlineOf($: EngineInterface, result: Result): Promise<stri
   for (const page of result.pages) {
     if (!fitsInline(page)) return null
     if (!inlined.has(page.file)) {
-      const got = await fsRead($, page.file, { as: 'bytes' }).catch(() => null)
+      const got = await cat($, page.file, { as: 'bytes' }).catch(() => null)
       const base64 = got && fitsInline(page, got.base64) ? got.base64 : null
       if (got) inlined.set(page.file, base64)
       for (const old of inlined.keys()) {
@@ -286,7 +292,8 @@ export const fileHref = (path: string) => `file://${encodeURI(path).replace(/[?#
 
 // The items as link rows: each file path made absolute from `base` (the
 // folder relative paths start from; `~/` is the home folder) and kept only
-// when it is a file now (each path checked once: linkFiles).
+// when it is a regular file now: no folder (an .app), no symbolic link
+// (each path checked once: linkFiles).
 export async function resolveLinks($: EngineInterface, items: readonly LinkItem[], base: string, home = S.env?.home ?? ''): Promise<ShownLink[]> {
   const shown: ShownLink[] = []
   for (const item of items) {
@@ -297,7 +304,8 @@ export async function resolveLinks($: EngineInterface, items: readonly LinkItem[
     const path = home && item.path.startsWith('~/') ? `${home.replace(/\/+$/, '')}${item.path.slice(1)}` : imagePathOf(item.path, base)
     let isFile = linkFiles.get(path)
     if (isFile === undefined) {
-      isFile = await fsExists($, path).catch(() => false)
+      const st = await stat($, path).catch(() => null)
+      isFile = st?.kind === 'file' && !st.isLink
       keep(linkFiles, path, isFile, LINK_FILES_KEPT)
     }
     if (isFile) shown.push({ kind: 'file', label: item.label, path, href: fileHref(path) })
@@ -317,8 +325,9 @@ export async function linksFor($: EngineInterface, text: string, base: string): 
 
 // Copies a command at a press of its row, with a toast.
 async function copyCommand($: EngineInterface, text: string, surface: RenderSurface) {
-  const copied = await uiCopy($, { text, surface }).catch(() => null)
-  uiToast($, copied?.isCopied ? 'Copied' : `Could not copy${copied ? `: ${copied.reason}` : ''}`)
+  ownCopy.note(text)
+  const copied = await copy($, { text, surface }).catch(() => null)
+  toast($, copied?.isCopied ? 'Copied' : `Could not copy${copied ? `: ${copied.reason}` : ''}`)
 }
 
 // One row per link, all dim and cut at the row's end (the copy counts them
@@ -338,6 +347,8 @@ export function drawLinks($: EngineInterface, e: ResolveInput<RenderComponent, '
       )
     }
     const href = link.href
+    // A file a plain open could run (the terminal opens a file:// link so): its path, no link.
+    if (link.kind === 'file' && !opensPlain(link.path)) return <Text dimColor wrap="truncate-end">· {link.label}</Text>
     return (
       <Text dimColor wrap="truncate-end">
         ↗ <Link href={href}>{link.label}</Link>

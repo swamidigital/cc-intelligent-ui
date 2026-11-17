@@ -22,8 +22,9 @@ import { forgetPages, holdPages, keyOf, needFrames } from './pagecache'
 import type { DrawnPage } from './copy'
 import type { SelRow } from './select'
 import { perlFor } from './host'
+import { WRITE_PL } from './flip'
 import { traceDebug } from './log'
-import { clockNow, processRun, uiBlit, uiLog } from './api'
+import { nowMs, exec, paint, log } from './api'
 
 export { bandOf, edgesOf, frameOf, framesOf, over, rgbOf, selectColor, type Frames, type Rgb } from './frames'
 
@@ -70,9 +71,8 @@ export const FRAME_MS = 16
 const FILES_KEPT = 4
 const FILE_KEEP_MS = 2000
 
-// Writes stdin's base64 to the file (its folder made, a temporary name,
-// then renamed), and deletes the older frames named after it.
-export const WRITE_PL = 'use MIME::Base64; local $/; my $b = <STDIN>; my ($f, @old) = @ARGV; my ($d) = $f =~ m{^(.*)/}; mkdir($d, 0700) unless -d $d; open(my $o, ">:raw", "$f.tmp") or die "$!\\n"; print $o decode_base64($b); close($o) or die "$!\\n"; rename("$f.tmp", $f) or die "$!\\n"; unlink(@old)'
+// The perl that writes a frame (flip.ts: it writes the PNGs of flip mode too).
+export { WRITE_PL } from './flip'
 
 // Each drawing's site (the requestId its Images are drawn under) and its
 // Images' key prefix, noted by drawPages; what each page shows now (sigOf,
@@ -115,7 +115,7 @@ function logOnce($: EngineInterface, text: string) {
   traceDebug($, `select: ${text}`)
   if (blits.logged.has(text)) return
   blits.logged.add(text)
-  void Promise.resolve(uiLog($, `Intelligent UI: picture select: ${text}`, { to: 'debug' })).catch(() => undefined)
+  void Promise.resolve(log($, `Intelligent UI: picture select: ${text}`, { to: 'debug' })).catch(() => undefined)
 }
 
 // The newest frame file's name, and the old ones that can go.
@@ -149,14 +149,14 @@ async function showPage($: EngineInterface, id: string, i: number, page: DrawnPa
       blits.shown.set(k, sig)
       return false
     }
-    const now = await clockNow($).catch(() => Date.now())
+    const now = await nowMs($).catch(() => Date.now())
     const t1 = performance.now()
     const made = frameNow(got.frames, rows)
     const png = made.png
     isWhole = made.isWhole
     const t2 = performance.now()
     const { path, old } = nextFile(env.cache, now)
-    const ran = await processRun($, [perlFor(env.isMac), '-e', WRITE_PL, path, ...old], { stdin: toBase64(png) }).catch(err => ({ exitCode: -1, stderr: String(err) }))
+    const ran = await exec($, [perlFor(env.isMac), '-e', WRITE_PL, path, ...old], { stdin: toBase64(png) }).catch(err => ({ exitCode: -1, stderr: String(err) }))
     const t3 = performance.now()
     if (ran.exitCode !== 0) {
       // No perl: no frame is tried again.
@@ -170,7 +170,7 @@ async function showPage($: EngineInterface, id: string, i: number, page: DrawnPa
     timing = `wait ${ms(got.waitMs)} frame ${ms(t2 - t1)}${isWhole ? '' : ' (part)'} write ${ms(t3 - t2)} ${png.length} bytes`
   }
   const t4 = performance.now()
-  const res = await uiBlit($, { requestId: site.requestId, key, source }).catch(err => ({ deny: String(err) }))
+  const res = await paint($, { requestId: site.requestId, key, source }).catch(err => ({ deny: String(err) }))
   const blit = `blit ${ms(performance.now() - t4)}`
   if (res.deny) {
     blits.shown.delete(k)

@@ -4,10 +4,10 @@
 import type { EngineInterface } from 'claude-code'
 
 import type { IuiTheme } from '../../types'
-import { CLIP_WAKE_MS, HOST_CHECK_MS, HOST_POLL_MS, MODES } from './settings'
+import { CLIP_WAKE_MS, HERDR_POLL_MS, HERDR_SCAN_MS, HOST_CHECK_MS, HOST_POLL_MS, MODES, OSC11_QUIET_MS } from './settings'
 import { S } from './state'
 import { beginEpoch } from './epoch'
-import { luminanceOf, modeOfColorFgBg, modeOfLuminance, modeOfMacAppearance, parseOsc11, resolveMode, schemeOfPortal, type HostMode } from './mode'
+import { keptOsc11, luminanceOf, OSC11_TRIES, modeOfColorFgBg, modeOfVar, modeOfLuminance, modeOfMacAppearance, parseOsc11, resolveMode, schemeOfPortal, type HostMode } from './mode'
 import {
   cmuxAppearanceOf, cmuxConfigOf, cmuxGhosttyConfigPath, cmuxSettingsOf, familyOfFc, GHOSTTY_DEFAULT_FONT, ghosttyBackgroundOf, ghosttyFontsOf, ghosttyHasColors,
   ghosttyThemePaths, ghosttyThemesOf,
@@ -16,8 +16,12 @@ import {
   rioConfigDirOf, RIO_DEFAULT_FONT, RIO_OLD_FONT, rioFontOf, rioForcedOf, rioThemeNamesOf, rioThemePath, tomlStringsOf, type CmuxAppearance, type KittyEntries,
 } from './terminals'
 import { firstLine } from './markdown'
-import { isGhosttyHere } from './terminal'
-import { clockEvery, envGet, fsExists, fsRead, processRun } from './api'
+import {
+  frontKindOf, herdrClientChanged, herdrClientsOf, herdrHostOf, herdrTickOf, herdrTickPick, isCmuxIn, isFlipHere, isGhosttyHere, isGhosttyIn, isKittyIn, isRioIn, pickHerdrClient,
+  ttyNameOf, type HerdrClient, type HerdrTick, type OuterName,
+} from './terminal'
+import { refont } from './frame'
+import { every, nowMs, getenv, exists, cat, exec } from './api'
 
 // One tty size read: `rows cols xpixel ypixel` (TIOCGWINSZ); exit 1 with no tty.
 export const CELL_SH = `perl -e 'open(T, "</dev/tty") or exit 1; my $w = " " x 8; ioctl(T, ($^O eq "darwin" ? 0x40087468 : 0x5413), $w) or exit 1; print join(" ", unpack("S4", $w))'`
@@ -193,18 +197,99 @@ export const OSC11_PL = [
 export const USE_OSC11 = false
 export const PROBE_RUNS = 5
 export const HEADERS_SH = `for f in "$@"; do head -c 24 "$f" | od -An -v -tx1; echo @; done`
+// herdr: the clients of this pane's server. One ps lists the processes;
+// this pane's server is the `herdr server` above this shell. A client is a
+// `herdr` of this user with a tty (no arguments, `--session <name>`,
+// `session attach <name>` or `client`). With more than one server, lsof
+// keeps the clients whose socket peer is one of this server's sockets (no
+// lsof, or no peer column as on Linux: all stay). On macOS it prints first
+// `front` and the bundle id of the app in front (lsappinfo; no line when
+// that can't be read), also when no client is found. Then for each client:
+// `pid`, `atime` (its tty's access time, a key read there; macOS: with a
+// fraction), `tty`, `cmd` (its command) and `app` (its nearest ancestor
+// with no tty: the terminal app) lines, then `env` and of the client's
+// variables only CLIENT_NAMES (Linux: from /proc/<pid>/environ,
+// NUL-separated; macOS: from `ps eww`, its command then the variables, cut
+// as envOfText does). pickHerdrClient chooses one.
+export const HERDR_CLIENT_SH = `s=$$
+u=$(uname -s)
+e='COLORFGBG|GHOSTTY_BIN_DIR|GHOSTTY_RESOURCES_DIR|ITERM_PROFILE|KITTY_CONFIG_DIRECTORY|RIO_CONFIG_HOME|CMUX_SOCKET_PATH|CMUX_SURFACE_ID|CMUX_WORKSPACE_ID|ITERM_SESSION_ID|KITTY_INSTALLATION_DIR|KITTY_PID|KITTY_WINDOW_ID|LC_TERMINAL|TERM|TERM_PROGRAM'
+if [ "$u" = Darwin ] && command -v lsappinfo >/dev/null 2>&1; then
+  f=$(lsappinfo info -only bundleid "$(lsappinfo front 2>/dev/null)" 2>/dev/null | sed -n 's/^"CFBundleIdentifier"="\\(.*\\)"$/\\1/p')
+  [ -n "$f" ] && printf 'front %s\\n' "$f"
+fi
+case $u in
+  Darwin|*BSD) t=$(ps -A -o pid= -o ppid= -o uid= -o tdev= -o command= 2>/dev/null) || exit 0
+    f='%Fa'; case $(stat -f %Fa /dev/null 2>/dev/null) in [0-9]*.[0-9]*) ;; *) f='%a' ;; esac
+    a=$(stat -f "%Hr/%Lr $f %N" /dev/ttys* 2>/dev/null) ;;
+  *) t=$(ps -A -o pid= -o ppid= -o uid= -o tty= -o command= 2>/dev/null) || exit 0; a=$(stat -c '%n %X %n' /dev/pts/[0-9]* /dev/tty[0-9]* 2>/dev/null | sed 's|^/dev/||') ;;
+esac
+c=$({ printf '%s\\n' "$a" | sed 's/^/@ /'; printf '%s\\n' "$t"; } | awk -v me="$(id -u)" -v self="$s" '
+  $1 == "@" { at[$2] = $3; nm[$2] = $4; sub(/^\\/dev\\//, "", nm[$2]); next }
+  { p = $1; pp[p] = $2; ty[p] = $4; x = $0; sub(/^ *[0-9]+ +[0-9]+ +[0-9]+ +[^ ]+ +/, "", x); cm[p] = x; if ($3 != me) next
+    n = split(x, w, " "); b = w[1]; sub(/.*\\//, "", b); if (b != "herdr") next
+    if (n == 2 && w[2] == "server") { srv[p] = 1; ns++; next }
+    r = x; sub(/^[^ ]+ ?/, "", r); if ((ty[p] in at) && r ~ /^(--session[= ][^ ]+|session attach [^ ]+|client)?$/) cl[p] = 1 }
+  END {
+    q = self; for (j = 0; j < 64 && q > 1; j++) { if (q in srv) break; q = pp[q] }
+    printf "srv\\t%d\\t%s\\n", ns, (q in srv) ? q : ""
+    for (p in cl) {
+      a = pp[p]; for (j = 0; j < 64 && a > 1 && ty[a] !~ /^[?-]+$/; j++) a = pp[a]
+      printf "cl\\t%s\\t%s\\t%s\\t%s\\t%s\\n", at[ty[p]], p, nm[ty[p]], cm[p], (a > 1 ? cm[a] : "") } }')
+n=$(printf '%s\\n' "$c" | awk -F '\\t' '$1 == "srv" { print $2 }')
+v=$(printf '%s\\n' "$c" | awk -F '\\t' '$1 == "srv" { print $3 }')
+l=$(printf '%s\\n' "$c" | grep '^cl')
+[ -n "$l" ] || exit 0
+if [ "\${n:-0}" -gt 1 ]; then
+  [ -n "$v" ] || exit 0
+  if command -v lsof >/dev/null 2>&1; then
+    k=$(lsof -a -U -p "$v,$(printf '%s\\n' "$l" | cut -f3 | paste -sd, -)" 2>/dev/null | awk -v v="$v" '$2 == v { a[$6] = 1 } $NF ~ /^->0x/ { e[NR] = substr($NF, 3); o[NR] = $2 } END { for (i in e) { f = 1; if (e[i] in a) print o[i] } if (f) print "peers" }')
+    case $k in *peers*) l=$({ printf '%s\\n@\\n' "$k"; printf '%s\\n' "$l"; } | awk -F '\\t' 'f == 0 { if ($0 == "@") f = 1; else m[$0] = 1; next } $3 in m') ;; esac
+  fi
+fi
+printf '%s\\n' "$l" | cut -f3 | while read -r p; do
+  printf '%s\\n' "$l" | awk -F '\\t' -v p="$p" '$3 == p { printf "pid %s\\natime %s\\ntty %s\\ncmd %s\\napp %s\\nenv\\n", $3, $2, $4, $5, $6 }'
+  if [ -r "/proc/$p/environ" ]; then tr '\\0' '\\n' < "/proc/$p/environ" | grep -E "^($e)=" | tr '\\n' '\\0'; echo
+  else ps eww -o command= -p "$p" | awk -v c="$(printf '%s\\n' "$l" | awk -F '\\t' -v p="$p" '$3 == p { print $5 }')" -v k="^($e)=" '
+    { x = $0; if (x == c || index(x, c " ") == 1) x = substr(x, length(c) + 1); else if (match(x, / [A-Za-z_][A-Za-z0-9_]*=/)) x = substr(x, RSTART); else x = ""
+      o = c; while (x != "") { x = substr(x, 2); w = x; x = ""; if (match(w, / [A-Za-z_][A-Za-z0-9_]*=/)) { x = substr(w, RSTART); w = substr(w, 1, RSTART - 1) }
+        if (w ~ k) o = o " " w }
+      print o }'; fi
+done
+exit 0`
+// herdr's light check, each HERDR_POLL_MS: argument 1 is the OS (uname -s),
+// the others the known clients' ttys (/dev/...). On macOS it prints `front`
+// and the bundle id of the app in front (as HERDR_CLIENT_SH), then an
+// `atime <tty> <time>` line per tty (with a fraction on macOS; none for a
+// tty that is gone). No ps: it costs a tenth of the full scan.
+export const HERDR_TICK_SH = `o=$1; shift
+if [ "$o" = Darwin ] && command -v lsappinfo >/dev/null 2>&1; then
+  f=$(lsappinfo info -only bundleid "$(lsappinfo front 2>/dev/null)" 2>/dev/null)
+  case $f in '"CFBundleIdentifier"="'*'"') f=\${f#*=\\"}; printf 'front %s\\n' "\${f%\\"}" ;; esac
+fi
+[ $# -gt 0 ] || exit 0
+case $o in
+  Darwin|*BSD) a=$(stat -f 'atime %N %Fa' "$@" 2>/dev/null)
+    case $a in *[0-9].[0-9]*) ;; *) a=$(stat -f 'atime %N %a' "$@" 2>/dev/null) ;; esac ;;
+  *) a=$(stat -c 'atime %n %X' "$@" 2>/dev/null) ;;
+esac
+[ -n "$a" ] && printf '%s\\n' "$a"
+exit 0`
 
 // The terminal's font family: iTerm2's profile font, Ghostty's font-family,
 // kitty's font_family, Rio's [fonts] family; '' elsewhere or when it can't
 // be read. A family that the terminal does not find is the one it draws in
-// its place (its own font, Menlo, or fontconfig's nearest). On Linux, when
-// the terminal's config names none: fontconfig's monospace font (fc-match),
-// which kitty and most terminals use.
+// its place (its own font, Menlo, or fontconfig's nearest). When none is
+// read (always over ssh): IUI_FONT, as installed here (as set when it is
+// not). Then on Linux: fontconfig's monospace font (fc-match), which kitty
+// and most terminals use.
 export async function termFontOf($: EngineInterface, isMac: boolean): Promise<string> {
   // Over ssh, a config here is not the one of the user's terminal.
-  if (S.isRemote) return ''
-  const font = await configFontOf($, isMac)
-  if (font || isMac) return font
+  const font = S.isRemote ? '' : await configFontOf($, isMac)
+  const named = font ? '' : ((await getenv($, 'IUI_FONT')) ?? '').trim()
+  S.fontByVar = !!named
+  if (font || named) return font || (await installedFamily($, isMac, named)) || named
+  if (isMac || S.isRemote) return ''
   return fcFamily($, 'monospace')
 }
 
@@ -214,20 +299,20 @@ export const fcPatternOf = (family: string) => family.replace(/[\\\-:,]/g, '\\$&
 // A family fontconfig gives for a pattern (the first of its names), '' when
 // fc-match fails. `fc-match` always gives a font, the nearest one.
 async function fcFamily($: EngineInterface, pattern: string): Promise<string> {
-  const got = await processRun($, ['fc-match', pattern, '-f', '%{family}'], { timeoutMs: 5000 }).catch(() => null)
+  const got = await exec($, ['fc-match', pattern, '-f', '%{family}'], { timeoutMs: 5000 }).catch(() => null)
   return got?.exitCode === 0 ? familyOfFc(got.stdout) : ''
 }
 
 // The family of the first font that fontconfig lists for a pattern (only
 // fonts that match it), '' for none.
 async function fcListFamily($: EngineInterface, pattern: string): Promise<string> {
-  const got = await processRun($, ['fc-list', pattern, 'family'], { timeoutMs: 5000 }).catch(() => null)
+  const got = await exec($, ['fc-list', pattern, 'family'], { timeoutMs: 5000 }).catch(() => null)
   return got?.exitCode === 0 ? familyOfFc(firstLine(got.stdout)) : ''
 }
 
 // What CoreText says of a family (HAS_FAMILY_JXA), '' when it can't be read.
 async function macFamily($: EngineInterface, family: string, mono = false): Promise<string> {
-  const got = await processRun($, ['osascript', '-l', 'JavaScript', '-e', HAS_FAMILY_JXA, family, ...(mono ? ['mono'] : [])], { timeoutMs: 5000 }).catch(() => null)
+  const got = await exec($, ['osascript', '-l', 'JavaScript', '-e', HAS_FAMILY_JXA, family, ...(mono ? ['mono'] : [])], { timeoutMs: 5000 }).catch(() => null)
   return got?.exitCode === 0 ? firstLine(got.stdout) : ''
 }
 
@@ -237,7 +322,7 @@ async function macFamily($: EngineInterface, family: string, mono = false): Prom
 // installed; null when that can't be read (then the name is taken as is).
 async function installedFamily($: EngineInterface, isMac: boolean, family: string, exact = false): Promise<string | null> {
   if (isMac && exact) {
-    const got = await processRun($, ['osascript', '-l', 'JavaScript', '-e', FAMILY_NOCASE_JXA, family], { timeoutMs: 5000 }).catch(() => null)
+    const got = await exec($, ['osascript', '-l', 'JavaScript', '-e', FAMILY_NOCASE_JXA, family], { timeoutMs: 5000 }).catch(() => null)
     const line = got?.exitCode === 0 ? firstLine(got.stdout) : ''
     return line.startsWith('=') ? line.slice(1) : line === 'no' ? '' : null
   }
@@ -245,7 +330,7 @@ async function installedFamily($: EngineInterface, isMac: boolean, family: strin
     const seen = await macFamily($, family)
     return seen === 'yes' ? family : seen === 'no' ? '' : null
   }
-  const got = await processRun($, ['fc-list', exact ? ':' : fcPatternOf(family), 'family'], { timeoutMs: 5000 }).catch(() => null)
+  const got = await exec($, ['fc-list', exact ? ':' : fcPatternOf(family), 'family'], { timeoutMs: 5000 }).catch(() => null)
   if (got?.exitCode !== 0) return null
   // Each line is a font's family names, split by commas, with `\` escapes.
   const names = got.stdout.split('\n').flatMap(line => line.split(/(?<!\\),/).map(name => name.replace(/\\(.)/g, '$1').trim())).filter(Boolean)
@@ -258,7 +343,7 @@ async function installedFamily($: EngineInterface, isMac: boolean, family: strin
 // such font) or 'failed' (no program, or the copy failed).
 async function programFont($: EngineInterface, isMac: boolean, o: { tag: string; family: string; name: string; paths: readonly string[] }): Promise<'copied' | 'none' | 'failed'> {
   const argv = ['sh', '-c', PROGRAM_FONTS_SH, 'sh', perlFor(isMac), PROGRAM_FONTS_PL, o.tag, o.family, o.name, ...o.paths]
-  const made = await processRun($, argv, { timeoutMs: 10000 }).catch(() => null)
+  const made = await exec($, argv, { timeoutMs: 10000, ...ghosttyInit() }).catch(() => null)
   const dir = made?.exitCode === 0 ? firstLine(made.stdout) : ''
   // No copy now: an older folder (maybe gone) is not given to Typst.
   if (!dir) S.fontPaths = ''
@@ -273,7 +358,7 @@ async function programFont($: EngineInterface, isMac: boolean, o: { tag: string;
 // when fontconfig has it (Linux), else from a copy of the one in Ghostty's
 // program (S.fontPaths).
 async function ghosttyDefaultFont($: EngineInterface, isMac: boolean): Promise<string> {
-  const got = await processRun($, ['fc-list', '-q', GHOSTTY_DEFAULT_FONT], { timeoutMs: 5000 }).catch(() => null)
+  const got = await exec($, ['fc-list', '-q', GHOSTTY_DEFAULT_FONT], { timeoutMs: 5000 }).catch(() => null)
   if (got?.exitCode === 0) return GHOSTTY_DEFAULT_FONT
   const o = { tag: 'ghostty', family: GHOSTTY_DEFAULT_FONT, name: 'ghostty', paths: GHOSTTY_PROGRAMS }
   return (await programFont($, isMac, o)) === 'copied' ? GHOSTTY_DEFAULT_FONT : ''
@@ -302,32 +387,118 @@ async function rioFont($: EngineInterface, isMac: boolean): Promise<string> {
   const named = rioFontOf((await readRioConfig($)).config)
   const found = named === RIO_DEFAULT_FONT ? '' : await installedFamily($, isMac, named, true)
   if (found !== '') return found ?? named
-  const home = (await envGet($, 'HOME')) ?? ''
+  const home = (await getenv($, 'HOME')) ?? ''
   const copy = await programFont($, isMac, { tag: 'rio', family: RIO_DEFAULT_FONT, name: 'rio', paths: rioProgramsOf(home) })
   if (copy === 'copied') return RIO_DEFAULT_FONT
   if (copy === 'none') return RIO_OLD_FONT
   return (await installedFamily($, isMac, RIO_OLD_FONT)) ? RIO_OLD_FONT : RIO_DEFAULT_FONT
 }
 
+// iTerm2, or herdr in iTerm2 (its profile and font; S.isIterm stays false
+// there, so the setup question for iTerm2 is not asked).
+const isItermHere = () => S.isIterm || S.herdrHost === 'iterm'
+
+// A variable of the terminal the user sees: under herdr the client's
+// (S.herdrClient; not set there is not set), else this process's.
+export function outerEnv($: EngineInterface, name: OuterName): Promise<string | undefined> {
+  const client = S.herdrClient
+  return client ? Promise.resolve(client.env[name] || undefined) : getenv($, name)
+}
+// GHOSTTY_SH and PROGRAM_FONTS_SH run the client's Ghostty under herdr ('': the PATH's).
+const ghosttyInit = () => (S.herdrClient ? { env: { GHOSTTY_BIN_DIR: S.herdrClient.env.GHOSTTY_BIN_DIR ?? '' } } : {})
+
+// The terminal values the font and mode readers use (S.itermProfile,
+// S.colorFgBg, S.herdrHost, S.isKitty, S.isCmux): under herdr the client's
+// when one is found, else this process's variables (under herdr: those of
+// the terminal that started its server, the fallback).
+export async function setOuter($: EngineInterface) {
+  S.itermProfile = (await outerEnv($, 'ITERM_PROFILE')) || undefined
+  S.colorFgBg = (await outerEnv($, 'COLORFGBG')) ?? ''
+  const client = S.herdrClient
+  if (client) {
+    S.herdrHost = client.kind
+    S.isKitty = client.kind === 'kitty'
+    S.isCmux = client.kind === 'cmux'
+    return
+  }
+  S.isCmux = isCmuxIn({ surface: await getenv($, 'CMUX_SURFACE_ID'), workspace: await getenv($, 'CMUX_WORKSPACE_ID'), socket: await getenv($, 'CMUX_SOCKET_PATH') })
+  S.herdrHost = S.isHerdr
+    ? herdrHostOf({
+      cmux: S.isCmux,
+      ghosttyResources: await getenv($, 'GHOSTTY_RESOURCES_DIR'),
+      ghosttyBin: await getenv($, 'GHOSTTY_BIN_DIR'),
+      kittyPid: await getenv($, 'KITTY_PID'),
+      kittyDir: await getenv($, 'KITTY_INSTALLATION_DIR'),
+      itermProfile: S.itermProfile,
+    })
+    : ''
+  S.isKitty = isKittyIn({ term: S.termName, windowId: await getenv($, 'KITTY_WINDOW_ID'), pid: await getenv($, 'KITTY_PID') }) || S.herdrHost === 'kitty'
+}
+
+// herdr: reads the clients (HERDR_CLIENT_SH; the full scan) and follows the
+// one that pickHerdrClient chooses (`was`: the client of before, kept while
+// the app in front has none). True when its terminal changed
+// (herdrClientChanged); a read that finds none keeps the last one. The
+// clients and the app in front are kept for the light check.
+export async function readHerdrClient($: EngineInterface, was: HerdrClient | null = S.herdrClient): Promise<boolean> {
+  const got = await exec($, ['sh', '-c', HERDR_CLIENT_SH], { timeoutMs: HOST_CHECK_MS }).catch(() => null)
+  const read = got?.exitCode === 0 ? herdrClientsOf(got.stdout) : null
+  // A failed scan counts too, so the next one waits HERDR_SCAN_MS.
+  S.herdrScanAt = await nowMs($).catch(() => Date.now())
+  if (read) {
+    S.herdrClients = read.clients
+    S.herdrScanFront = read.front
+  }
+  const pick = read ? pickHerdrClient(read.clients, read.front === null ? null : frontKindOf(read.front), was) : null
+  if (!pick) return false
+  if (pick.by !== 'kept') S.herdrBy = pick.by
+  const changed = herdrClientChanged(S.herdrClient, pick.client)
+  S.herdrClient = pick.client
+  return changed
+}
+
+// herdr's check each HERDR_POLL_MS: the light check (HERDR_TICK_SH, then
+// herdrTickPick on the clients of the last scan), else the full scan
+// (readHerdrClient). True when the terminal changed.
+export async function checkHerdrClient($: EngineInterface): Promise<boolean> {
+  const now = await nowMs($).catch(() => Date.now())
+  const ageMs = S.herdrScanAt === null ? null : now - S.herdrScanAt
+  let tick: HerdrTick | null = null
+  if (ageMs !== null && ageMs < HERDR_SCAN_MS) {
+    const ttys = S.herdrClients.map(c => `/dev/${ttyNameOf(c.tty)}`)
+    // No client (a detached or remote pane): nothing to read, no process.
+    const got = ttys.length ? await exec($, ['sh', '-c', HERDR_TICK_SH, 'sh', S.hostOs, ...ttys], { timeoutMs: HOST_CHECK_MS }).catch(() => null) : { exitCode: 0, stdout: '' }
+    tick = got?.exitCode === 0 ? herdrTickOf(got.stdout) : null
+  }
+  const light = herdrTickPick({ clients: S.herdrClients, tick, was: S.herdrClient, scanFront: S.herdrScanFront, ageMs })
+  if (!light) return readHerdrClient($)
+  S.herdrClients = light.clients
+  if (!light.pick) return false
+  if (light.pick.by !== 'kept') S.herdrBy = light.pick.by
+  const changed = herdrClientChanged(S.herdrClient, light.pick.client)
+  S.herdrClient = light.pick.client
+  return changed
+}
+
 // The font that the terminal's own config or profile names.
 async function configFontOf($: EngineInterface, isMac: boolean): Promise<string> {
-  if (S.isIterm && isMac) {
-    const profile = await envGet($, 'ITERM_PROFILE')
+  if (isItermHere() && isMac) {
+    const profile = S.itermProfile
     const [marks, guid] = await Promise.all([
-      processRun($, ['sh', '-c', ITERM_BOOKMARKS_SH], { timeoutMs: 5000 }).catch(() => null),
-      processRun($, ['sh', '-c', ITERM_DEFAULT_SH], { timeoutMs: 5000 }).catch(() => null),
+      exec($, ['sh', '-c', ITERM_BOOKMARKS_SH], { timeoutMs: 5000 }).catch(() => null),
+      exec($, ['sh', '-c', ITERM_DEFAULT_SH], { timeoutMs: 5000 }).catch(() => null),
     ])
     // A read that failed or no profile: not known.
     const font = marks?.exitCode === 0 ? itermFontOf(marks.stdout, profile, guid?.stdout ?? '') : null
     if (font === null) return ''
     // An empty or bad profile font, or one that is not installed: iTerm2 draws the user's fixed-pitch font.
-    const named = await processRun($, ['osascript', '-l', 'JavaScript', '-e', FAMILY_JXA, parseFontSpec(font)?.name ?? '', 'user'], { timeoutMs: 5000 }).catch(() => null)
+    const named = await exec($, ['osascript', '-l', 'JavaScript', '-e', FAMILY_JXA, parseFontSpec(font)?.name ?? '', 'user'], { timeoutMs: 5000 }).catch(() => null)
     return named?.exitCode === 0 ? firstLine(named.stdout) : ''
   }
   if (isGhosttyHere()) {
-    const shown = await processRun($, ['sh', '-c', GHOSTTY_SH], { timeoutMs: 5000 }).catch(() => null)
+    const shown = await exec($, ['sh', '-c', GHOSTTY_SH], { timeoutMs: 5000, ...ghosttyInit() }).catch(() => null)
     // cmux loads its own config after Ghostty's; +show-config does not read it.
-    const own = S.isCmux ? ((await readText($, cmuxGhosttyConfigPath((await envGet($, 'HOME')) ?? ''))) ?? '') : ''
+    const own = S.isCmux ? ((await readText($, cmuxGhosttyConfigPath((await getenv($, 'HOME')) ?? ''))) ?? '') : ''
     return ghosttyFont($, isMac, ghosttyFontsOf(cmuxConfigOf(shown?.stdout ?? '', own)))
   }
   if (S.isKitty) {
@@ -343,7 +514,7 @@ async function configFontOf($: EngineInterface, isMac: boolean): Promise<string>
       const seen = 'family' in font ? await macFamily($, name, true) : 'no'
       if (seen === 'yes' || seen === '') return name
       if (seen === 'proportional') return KITTY_MAC_FONT
-      const named = await processRun($, ['osascript', '-l', 'JavaScript', '-e', FAMILY_JXA, name], { timeoutMs: 5000 }).catch(() => null)
+      const named = await exec($, ['osascript', '-l', 'JavaScript', '-e', FAMILY_JXA, name], { timeoutMs: 5000 }).catch(() => null)
       return named?.exitCode === 0 ? firstLine(named.stdout) || KITTY_MAC_FONT : ''
     }
     const found = 'family' in font ? await installedFamily($, isMac, name) : ''
@@ -356,36 +527,63 @@ async function configFontOf($: EngineInterface, isMac: boolean): Promise<string>
 }
 
 // The mode for auto now, or null when nothing can be read (keep the last
-// one): 1. the terminal's OSC 11 answer (off, see USE_OSC11); 2. the
-// terminal's own settings (iTerm2's profile, Ghostty's, kitty's or Rio's
-// config); 3. COLORFGBG at start; 4. the
-// OS appearance; 5. dark (resolveMode). The terminal comes before the OS: a
-// dark terminal on a light Mac is dark. Over ssh, only COLORFGBG (when ssh
-// sends it): the configs and the OS here are the remote computer's.
-export async function readHostMode($: EngineInterface): Promise<HostMode | null> {
+// one): 0. under herdr, local or remote, its pane's OSC 11 answer (the
+// background of the terminal in front), asked only with `ask` (osc11Due)
+// and kept while the sources below do not change (keptOsc11); 1. the
+// terminal's OSC 11 answer (off, see USE_OSC11); 2. the terminal's own
+// settings (iTerm2's profile, Ghostty's, kitty's or Rio's config); 3.
+// IUI_MODE; 4. COLORFGBG at start; 5. the OS appearance; 6. dark
+// (resolveMode). The terminal comes before the OS: a dark terminal on a
+// light Mac is dark. Over ssh, only IUI_MODE and COLORFGBG (when ssh sends
+// it): the configs and the OS here are the remote computer's.
+export async function readHostMode($: EngineInterface, ask = false): Promise<HostMode | null> {
+  if (!S.isHerdr) return readOwnMode($)
+  let answer: HostMode | null | undefined
+  if (ask) {
+    S.osc11Tries = Math.max(0, S.osc11Tries - 1)
+    const bg = parseOsc11((await probeOsc11($).catch(() => null))?.reply ?? '')
+    answer = bg ? { mode: modeOfLuminance(luminanceOf(bg)), source: 'herdr', detail: 'OSC 11 background of the terminal in front' } : null
+    if (answer) S.osc11Tries = 0
+  }
+  const { kept, use } = keptOsc11(S.osc11Kept, await readOwnMode($).catch(() => null), answer)
+  S.osc11Kept = kept
+  return use
+}
+
+// Under herdr, an OSC 11 probe is due: tries are left (the start or a new
+// client, with auto), the mod draws herdr pictures and is on, and no key
+// came in the prompt box for OSC11_QUIET_MS.
+export async function osc11Due($: EngineInterface, off = S.isOff): Promise<boolean> {
+  if (S.osc11Tries <= 0 || !S.isHerdr || !S.herdrDraws || off || S.setting !== 'auto') return false
+  return (await nowMs($).catch(() => Date.now())) - S.keyAt >= OSC11_QUIET_MS
+}
+
+// Sources 1 to 6 of readHostMode.
+async function readOwnMode($: EngineInterface): Promise<HostMode | null> {
   if (USE_OSC11) {
     const bg = parseOsc11((await probeOsc11($))?.reply ?? '')
     if (bg) return { mode: modeOfLuminance(luminanceOf(bg)), source: 'terminal', detail: 'OSC 11 background' }
   }
-  if (S.isRemote) {
-    const mode = modeOfColorFgBg(S.colorFgBg)
-    return mode ? { mode, source: 'COLORFGBG' } : null
-  }
-  const term =
-    (await readItermMode($).catch(() => null)) ??
+  // Over ssh, a config here is not the one of the user's terminal.
+  const term = S.isRemote
+    ? null
+    : (await readItermMode($).catch(() => null)) ??
     (await readGhosttyMode($).catch(() => null)) ??
     (await readKittyMode($).catch(() => null)) ??
     (await readRioMode($).catch(() => null))
   if (term) return term
+  const set = modeOfVar(await getenv($, 'IUI_MODE'))
+  if (set) return { mode: set, source: 'IUI_MODE' }
   const mode = modeOfColorFgBg(S.colorFgBg)
+  if (S.isRemote) return mode ? { mode, source: 'COLORFGBG' } : null
   if (mode) return { mode, source: 'COLORFGBG' }
   return readOsMode($).catch(() => null)
 }
 
 // The background of the iTerm2 profile in use, on a Mac.
 async function readItermMode($: EngineInterface): Promise<HostMode | null> {
-  if (!S.isIterm || S.hostOs !== 'Darwin') return null
-  const got = await processRun($, ['sh', '-c', ITERM_MODE_SH], { timeoutMs: HOST_CHECK_MS }).catch(() => null)
+  if (!isItermHere() || S.hostOs !== 'Darwin') return null
+  const got = await exec($, ['sh', '-c', ITERM_MODE_SH], { timeoutMs: HOST_CHECK_MS }).catch(() => null)
   if (!got || got.exitCode !== 0) return null
   const [style = '', guid = '', marks = ''] = got.stdout.split(/^@\n/m)
   const appearance = itermAppearanceOf(style) ?? (await readOsMode($).catch(() => null))?.mode ?? null
@@ -396,17 +594,18 @@ async function readItermMode($: EngineInterface): Promise<HostMode | null> {
 // One OSC 11 question to the terminal: its raw answer ('' for none), or null
 // when the tty could not be opened.
 export async function probeOsc11($: EngineInterface): Promise<{ reply: string } | null> {
-  const got = await processRun($, ['perl', '-e', OSC11_PL], { timeoutMs: HOST_CHECK_MS }).catch(() => null)
+  const got = await exec($, ['perl', '-e', OSC11_PL], { timeoutMs: HOST_CHECK_MS }).catch(() => null)
   return got && got.exitCode === 0 ? { reply: got.stdout } : null
 }
 
 // The background of Ghostty's config. A `light:A,dark:B` theme follows the OS
-// (in cmux, cmux's appearance). In cmux, cmux's own config is read as well.
+// (in cmux, cmux's appearance). In cmux, cmux's own config is read as well;
+// herdr in Ghostty reads Ghostty's.
 async function readGhosttyMode($: EngineInterface): Promise<HostMode | null> {
-  if (!/ghostty/i.test(S.termProgram + S.termName)) return null
-  const got = await processRun($, ['sh', '-c', GHOSTTY_SH], { timeoutMs: HOST_CHECK_MS }).catch(() => null)
+  if (!isGhosttyIn(S.termProgram, S.termName) && S.herdrHost !== 'ghostty' && S.herdrHost !== 'cmux') return null
+  const got = await exec($, ['sh', '-c', GHOSTTY_SH], { timeoutMs: HOST_CHECK_MS, ...ghosttyInit() }).catch(() => null)
   if (!got || got.exitCode !== 0) return null
-  const home = (await envGet($, 'HOME')) ?? ''
+  const home = (await getenv($, 'HOME')) ?? ''
   const own = S.isCmux ? ((await readText($, cmuxGhosttyConfigPath(home))) ?? '') : ''
   const config = cmuxConfigOf(got.stdout, own)
   if (S.isCmux && !ghosttyHasColors(config)) {
@@ -419,13 +618,13 @@ async function readGhosttyMode($: EngineInterface): Promise<HostMode | null> {
   if (pair) {
     appearance = S.isCmux ? ((await readCmuxAppearance($).catch(() => null))?.mode ?? null) : ((await readOsMode($).catch(() => null))?.mode ?? null)
     const where = {
-      xdgConfig: (await envGet($, 'XDG_CONFIG_HOME')) || undefined,
+      xdgConfig: (await getenv($, 'XDG_CONFIG_HOME')) || undefined,
       home,
-      resources: (await envGet($, 'GHOSTTY_RESOURCES_DIR')) || undefined,
+      resources: (await outerEnv($, 'GHOSTTY_RESOURCES_DIR')) || undefined,
     }
     for (const mode of MODES) {
       for (const path of ghosttyThemePaths(pair[mode], where)) {
-        const text = await fsRead($, path).catch(() => null)
+        const text = await cat($, path).catch(() => null)
         if (typeof text !== 'string') continue
         themeBg[mode] = ghosttyValueOf(text, 'background')
         break
@@ -443,7 +642,7 @@ async function readGhosttyMode($: EngineInterface): Promise<HostMode | null> {
 // (terminal.adaptiveDefaultTheme, on unless cmux.json turns it off) follows
 // cmux's appearance, the OS's when that is system. Null when it is off.
 async function readCmuxMode($: EngineInterface): Promise<HostMode | null> {
-  const home = (await envGet($, 'HOME')) ?? ''
+  const home = (await getenv($, 'HOME')) ?? ''
   const settings = cmuxSettingsOf(jsoncOf((await readText($, `${home}/.config/cmux/cmux.json`)) ?? ''))
   if (settings.adaptive === false) return null
   const seen = await readCmuxAppearance($, settings.appearance)
@@ -454,12 +653,12 @@ async function readCmuxMode($: EngineInterface): Promise<HostMode | null> {
 // mode it gives: the OS's when it is system. Null when that is not known.
 async function readCmuxAppearance($: EngineInterface, file?: CmuxAppearance): Promise<{ mode: IuiTheme; appearance: CmuxAppearance } | null> {
   if (file === undefined) {
-    const home = (await envGet($, 'HOME')) ?? ''
+    const home = (await getenv($, 'HOME')) ?? ''
     file = cmuxSettingsOf(jsoncOf((await readText($, `${home}/.config/cmux/cmux.json`)) ?? '')).appearance
   }
   let saved = ''
   if (!file && S.hostOs === 'Darwin') {
-    const got = await processRun($, ['defaults', 'read', 'com.cmuxterm.app', 'appearanceMode'], { timeoutMs: HOST_CHECK_MS }).catch(() => null)
+    const got = await exec($, ['defaults', 'read', 'com.cmuxterm.app', 'appearanceMode'], { timeoutMs: HOST_CHECK_MS }).catch(() => null)
     saved = got?.exitCode === 0 ? got.stdout : ''
   }
   const appearance = cmuxAppearanceOf(file, saved)
@@ -467,28 +666,28 @@ async function readCmuxAppearance($: EngineInterface, file?: CmuxAppearance): Pr
   return mode ? { mode, appearance } : null
 }
 
-// Rio sets TERM_PROGRAM=rio, and TERM=rio when its terminfo is installed.
-const isRioHere = () => /^rio$/i.test(S.termProgram) || /^rio$/i.test(S.termName)
+// Rio sets TERM_PROGRAM=rio, and TERM=rio when its terminfo is installed; or herdr in Rio.
+const isRioHere = () => isRioIn(S.termProgram, S.termName) || S.herdrHost === 'rio'
 
 // A file's text, or null when it can't be read.
 export async function readText($: EngineInterface, path: string): Promise<string | null> {
-  const text = await fsRead($, path).catch(() => null)
+  const text = await cat($, path).catch(() => null)
   return typeof text === 'string' ? text : null
 }
 
 // kitty's config folder and kitty.conf with its includes: the first folder
 // that has a kitty.conf, else the first folder (auto theme files can be there).
 async function readKittyConfig($: EngineInterface): Promise<{ dir: string; entries: KittyEntries; home: string }> {
-  const home = (await envGet($, 'HOME')) ?? ''
+  const home = (await getenv($, 'HOME')) ?? ''
   const dirs = kittyConfigDirsOf({
-    kittyDir: (await envGet($, 'KITTY_CONFIG_DIRECTORY')) || undefined,
-    xdgConfig: (await envGet($, 'XDG_CONFIG_HOME')) || undefined,
+    kittyDir: (await outerEnv($, 'KITTY_CONFIG_DIRECTORY')) || undefined,
+    xdgConfig: (await getenv($, 'XDG_CONFIG_HOME')) || undefined,
     home,
     isMac: S.hostOs === 'Darwin',
   })
   const o = { home, vars: { KITTY_OS: S.hostOs === 'Darwin' ? 'macos' : S.hostOs.toLowerCase() } }
   for (const dir of dirs) {
-    if (!(await fsExists($, `${dir}/kitty.conf`).catch(() => false))) continue
+    if (!(await exists($, `${dir}/kitty.conf`).catch(() => false))) continue
     return { dir, entries: await kittyEntriesOf(`${dir}/kitty.conf`, path => readText($, path), o), home }
   }
   return { dir: dirs[0]!, entries: [], home }
@@ -500,7 +699,7 @@ async function readKittyMode($: EngineInterface): Promise<HostMode | null> {
   if (!S.isKitty) return null
   const { dir, entries, home } = await readKittyConfig($)
   const schemes = ['dark', 'light', 'no-preference'] as const
-  const found = await Promise.all(schemes.map(s => fsExists($, `${dir}/${kittyAutoFileOf(s)}`).catch(() => false)))
+  const found = await Promise.all(schemes.map(s => exists($, `${dir}/${kittyAutoFileOf(s)}`).catch(() => false)))
   let auto: { file: string; entries: KittyEntries } | null = null
   if (found.some(Boolean)) {
     let scheme: (typeof schemes)[number] | null = null
@@ -519,9 +718,9 @@ async function readKittyMode($: EngineInterface): Promise<HostMode | null> {
 // Rio's config folder and its config.toml's string values.
 async function readRioConfig($: EngineInterface): Promise<{ dir: string; config: Record<string, string> }> {
   const dir = rioConfigDirOf({
-    rioHome: (await envGet($, 'RIO_CONFIG_HOME')) || undefined,
-    xdgConfig: (await envGet($, 'XDG_CONFIG_HOME')) || undefined,
-    home: (await envGet($, 'HOME')) ?? '',
+    rioHome: (await outerEnv($, 'RIO_CONFIG_HOME')) || undefined,
+    xdgConfig: (await getenv($, 'XDG_CONFIG_HOME')) || undefined,
+    home: (await getenv($, 'HOME')) ?? '',
     isMac: S.hostOs === 'Darwin',
   })
   return { dir, config: tomlStringsOf((await readText($, `${dir}/config.toml`)) ?? '') }
@@ -545,7 +744,7 @@ async function readRioMode($: EngineInterface): Promise<HostMode | null> {
 // (readLinuxScheme; no preference is light, as GNOME's default is).
 async function readOsMode($: EngineInterface): Promise<HostMode | null> {
   if (S.hostOs === 'Darwin') {
-    const got = await processRun($, ['defaults', 'read', '-g', 'AppleInterfaceStyle'], { timeoutMs: HOST_CHECK_MS }).catch(() => null)
+    const got = await exec($, ['defaults', 'read', '-g', 'AppleInterfaceStyle'], { timeoutMs: HOST_CHECK_MS }).catch(() => null)
     return got ? { mode: modeOfMacAppearance(got.exitCode, got.stdout), source: 'macOS' } : null
   }
   if (S.hostOs === 'Linux') {
@@ -569,7 +768,7 @@ type LinuxScheme = { scheme: 'dark' | 'light' | 'no-preference'; source: 'deskto
 async function readLinuxScheme($: EngineInterface): Promise<LinuxScheme | null> {
   const tools = S.portalTool === null ? (['gdbus', 'busctl'] as const) : S.portalTool ? [S.portalTool] : []
   for (const tool of tools) {
-    const got = await processRun($, PORTAL_ARGS[tool], { timeoutMs: HOST_CHECK_MS }).catch(() => null)
+    const got = await exec($, PORTAL_ARGS[tool], { timeoutMs: HOST_CHECK_MS }).catch(() => null)
     const scheme = got && got.exitCode === 0 ? schemeOfPortal(got.stdout) : null
     if (scheme) {
       S.portalTool = tool
@@ -578,21 +777,43 @@ async function readLinuxScheme($: EngineInterface): Promise<LinuxScheme | null> 
   }
   if (S.portalTool === null) S.portalTool = ''
   if (S.portalTool) return null
-  const got = await processRun($, ['gsettings', 'get', 'org.gnome.desktop.interface', 'color-scheme'], { timeoutMs: HOST_CHECK_MS }).catch(() => null)
+  const got = await exec($, ['gsettings', 'get', 'org.gnome.desktop.interface', 'color-scheme'], { timeoutMs: HOST_CHECK_MS }).catch(() => null)
   const scheme = got && got.exitCode === 0 ? kittySchemeOfGnome(got.stdout) : null
   return scheme ? { scheme, source: 'GNOME' } : null
 }
 
-// One read of the OS appearance (never two at once); a changed mode redraws.
-export async function pollHost($: EngineInterface) {
-  if (S.checking || S.setting !== 'auto') return
+// One poll (never two at once): under herdr the client first (another
+// terminal sets the terminal values again, then the font and its metrics
+// are read again), then with auto the mode. A changed mode, font or flip
+// mode (isFlipHere: iTerm2 in or out) redraws. Under herdr the mode is read
+// each HOST_POLL_MS (every third poll), at once for another terminal, and
+// with `modeNow`. No timed OSC 11 probe: only one that osc11Due allows
+// (the start or a new client), never for `modeNow` (a dialog can be open).
+export async function pollHost($: EngineInterface, modeNow = false) {
+  const herdr = herdrPolled()
+  if (S.checking || (S.setting !== 'auto' && !herdr)) return
   S.checking = true
+  let refonted = false
+  const flipWas = isFlipHere()
   try {
-    S.host = (await readHostMode($).catch(() => null)) ?? S.host
+    const moved = herdr && (await checkHerdrClient($).catch(() => false))
+    if (moved) {
+      await setOuter($)
+      // The answer was the terminal of before: a new client is asked again.
+      S.osc11Kept = null
+      S.osc11Tries = S.setting === 'auto' ? OSC11_TRIES : 0
+    }
+    const ask = herdr && !modeNow && (await osc11Due($))
+    const due = !herdr || modeNow || moved || ask || ++S.hostTicks >= HOST_POLL_MS / HERDR_POLL_MS
+    if (due) S.hostTicks = 0
+    if (S.setting === 'auto' && due) S.host = (await readHostMode($, ask).catch(() => null)) ?? S.host
+    if (moved) refonted = await refont($).catch(() => false)
   } finally {
     S.checking = false
   }
-  showMode($)
+  if (!refonted && isFlipHere() === flipWas) return showMode($)
+  S.theme = resolveMode(S.setting, S.host)
+  beginEpoch($)
 }
 
 // Draws in the mode the setting and the OS give, when it changed: a new
@@ -604,16 +825,33 @@ export function showMode($: EngineInterface) {
   beginEpoch($)
 }
 
-// Polls the OS appearance while the setting is auto, and only then.
+// herdr's client is checked: under herdr, with pictures drawn and the mod on.
+const herdrPolled = () => S.isHerdr && S.herdrDraws && !S.isOff
+
+// Polls while the setting is auto or herdr's client is checked (it can
+// change), and only then, until the session ends: each HOST_POLL_MS, while
+// herdr's client is checked each HERDR_POLL_MS.
 export function watchHost($: EngineInterface) {
-  if (S.setting === 'auto' && !S.watch) {
-    try {
-      S.watch = clockEvery($, HOST_POLL_MS, () => void pollHost($).catch(() => undefined))
-    } catch {
-      S.watch = null
-    }
-  } else if (S.setting !== 'auto' && S.watch) {
+  const wanted = !S.hostEnded && (S.setting === 'auto' || herdrPolled())
+  const ms = herdrPolled() ? HERDR_POLL_MS : HOST_POLL_MS
+  // Started before setUp knew of herdr: started again with its period.
+  if (S.watch && (!wanted || S.watchMs !== ms)) {
     S.watch.cancel()
     S.watch = null
   }
+  if (wanted && !S.watch) {
+    try {
+      S.watch = every($, ms, () => void pollHost($).catch(() => undefined))
+      S.watchMs = ms
+    } catch {
+      S.watch = null
+    }
+  }
+}
+
+// The session ends (not a /clear): no more polls.
+export function stopHost() {
+  S.hostEnded = true
+  S.watch?.cancel()
+  S.watch = null
 }

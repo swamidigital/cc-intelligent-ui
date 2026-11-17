@@ -8,14 +8,17 @@
 // engine's dialog never shows. An allow is honoured for this tool only with
 // `updatedInput`, and its `setMode` ends plan mode. The rendered plan is in
 // the ExitPlanMode ToolUse row, which the engine draws above the question.
+// The question waits for the plan's pictures; with none, the mod gives no
+// verdict and the engine's dialog (which shows the plan's text) asks.
 import type { EngineInterface, PermissionRequestDecision, RenderComponent, RenderElement, RenderViewport, ResolveInput } from 'claude-code'
 
-import { GUTTER, bulletOf } from './settings'
+import { COMPILE_TIMEOUT_MS, GUTTER, bulletOf } from './settings'
 import { S, writesLive } from './state'
 import { firstLine } from './markdown'
 import type { Drawing } from './answer'
 import { drawPages, type ShownLink } from './draw'
-import { clockAfter, commandRun, envGet, fsRead, processRun, submit, turnAbort, uiAsk, uiResolve } from './api'
+import { delay, runCmd, getenv, cat, exec, send, abort, ask, toast, uiResolve } from './api'
+import { OPEN_TIMEOUT_MS, pathsOf } from './open'
 
 // The question's chip and its two wordings.
 export const PLAN_HEADER = 'Plan'
@@ -26,11 +29,18 @@ export const PLAN_AUTO = 'Yes, auto-accept edits'
 export const PLAN_MANUAL = 'Yes, manually approve edits'
 export const PLAN_CLEAR = 'Yes, clear context + auto-accept'
 export const PLAN_EDIT = 'Edit the plan'
+// The question while a Mac's text editor has the plan file open (`open`
+// does not wait), and its options.
+export const PLAN_EDITING = 'Save the plan in the editor, then choose Done editing.'
+export const PLAN_DONE = 'Done editing'
+export const PLAN_REOPEN = 'Open the plan file again'
 // The line above Intelligent UI's question (the dialog takes 12 rows at most
 // around it, so the plan itself is in the ToolUse row above).
 export const PLAN_ASK_LINE = 'Intelligent UI: the rendered plan is above'
 // The line in the ToolUse row while the plan's pictures compile.
 export const PLAN_DRAWING = 'Intelligent UI: drawing the plan...'
+// The toast when a plan asked again after an edit has no pictures.
+export const PLAN_EDITED_UNDRAWN = "Intelligent UI: the edited plan's pictures did not draw; it is the text you saved"
 // What the model reads when the person rejects the plan (Esc) or types changes.
 export const PLAN_REJECTED = 'The user rejected the plan.'
 export const PLAN_FEEDBACK = 'The user wants changes to the plan:'
@@ -41,6 +51,9 @@ export const EDIT_TIMEOUT_MS = 600000
 // How long the plan waits for a Write or Edit of its file still running.
 export const PLAN_WRITE_WAIT_MS = 5000
 export const PLAN_WRITE_POLL_MS = 25
+// How long the question waits for the plan's pictures: a compile and its
+// retry in safe mode, and a moment in the queue.
+export const PLAN_DRAW_WAIT_MS = 2 * COMPILE_TIMEOUT_MS + 5000
 // The delay before "clear context" acts: `$.command.run` rejects inside a hook
 // the turn waits on, so it runs detached once the call has resolved.
 export const CLEAR_DELAY_MS = 50
@@ -143,18 +156,22 @@ export function decisionOf(verdict: PlanVerdict, toolInput: unknown): Permission
   return { behavior: 'allow', updatedInput: input, updatedPermissions: [{ type: 'setMode', mode: verdict.mode, destination: 'session' }] }
 }
 
-// The editor that opens the plan file and waits until it is closed: VS Code
-// (`code --wait`) when it is on the PATH, else TextEdit on a Mac (`open -W`
-// waits until TextEdit quits), else on Linux a GUI editor that waits
-// (`gui`: its path and flag, LINUX_EDITORS). Not over ssh, where TextEdit
-// or the GUI editor is the remote computer's. A mod has no terminal, so no
+// The editor that opens the plan file: VS Code (`code --wait`) when it is on
+// the PATH, else on a Mac the default text editor (`open -t`: it does not
+// wait, as `open -W` waits until the whole app quits, not the window; the
+// person says when they are done, PLAN_EDITING), else on Linux a GUI editor
+// that waits (`gui`: its path and flag, LINUX_EDITORS). Not over ssh, where
+// that editor is the remote computer's. A mod has no terminal, so no
 // terminal editor; xdg-open does not wait, so it is not used.
 export function editorArgv(o: { code: string; isMac: boolean; isRemote: boolean; gui?: readonly string[] }, file: string): string[] | null {
   if (o.code) return [o.code, '--wait', file]
-  if (o.isMac && !o.isRemote) return ['open', '-W', '-t', file]
+  if (o.isMac && !o.isRemote) return ['open', '-t', file]
   if (!o.isMac && !o.isRemote && o.gui?.length) return [...o.gui, file]
   return null
 }
+
+// Whether the editor's command returns only once the file is closed (not `open`).
+export const editorWaits = (argv: readonly string[]) => argv[0] !== 'open'
 
 // The GUI editors on Linux that can wait until the file is closed, in the
 // order they are looked for, with the flag that makes them wait.
@@ -176,17 +193,8 @@ export function guiEditorOf(stdout: string): string[] {
 // The `code` command's path ('' when none), looked up once per load.
 async function findCode($: EngineInterface): Promise<string> {
   if (S.planCode !== null) return S.planCode
-  let found = ''
-  for (const flag of ['-lc', '-c']) {
-    const got = await processRun($, ['sh', flag, 'command -v code'], { timeoutMs: 5000 }).catch(() => null)
-    const path = got?.exitCode === 0 ? firstLine(got.stdout) : ''
-    if (path.startsWith('/')) {
-      found = path
-      break
-    }
-  }
-  S.planCode = found
-  return found
+  S.planCode = (await pathsOf($, ['code'])).get('code') ?? ''
+  return S.planCode
 }
 
 // On Linux with a display (X11 or Wayland), a GUI editor that waits
@@ -194,9 +202,9 @@ async function findCode($: EngineInterface): Promise<string> {
 async function findGuiEditor($: EngineInterface): Promise<string[]> {
   if (S.planGui !== null) return S.planGui
   let found: string[] = []
-  if ((await envGet($, 'WAYLAND_DISPLAY')) || (await envGet($, 'DISPLAY'))) {
+  if ((await getenv($, 'WAYLAND_DISPLAY')) || (await getenv($, 'DISPLAY'))) {
     for (const flag of ['-lc', '-c']) {
-      const got = await processRun($, ['sh', flag, GUI_EDITOR_SH], { timeoutMs: 5000 }).catch(() => null)
+      const got = await exec($, ['sh', flag, GUI_EDITOR_SH], { timeoutMs: 5000 }).catch(() => null)
       found = got?.exitCode === 0 ? guiEditorOf(got.stdout) : []
       if (found.length) break
     }
@@ -205,18 +213,25 @@ async function findGuiEditor($: EngineInterface): Promise<string[]> {
   return found
 }
 
-// What the mod's question decided: a verdict for the PermissionRequest, or
-// the person's words (a deny of the call: Claude revises the plan).
-export type PlanOutcome = { kind: 'verdict'; verdict: PlanVerdict } | { kind: 'feedback'; message: string }
+// What the mod's question decided: a verdict for the PermissionRequest, the
+// person's words (a deny of the call: Claude revises the plan), or nothing
+// (`engine`: the plan's pictures did not draw, so the engine's dialog asks).
+export type PlanOutcome = { kind: 'verdict'; verdict: PlanVerdict } | { kind: 'feedback'; message: string } | { kind: 'engine' }
 
 // Asks the mod's question about the plan, as often as the person edits it.
 // `plan` is the text to ask about, `callPlan` the one the call carried (an
 // approval sends `plan` when they differ). `onEdited` gets each edited text
-// (the ToolUse row draws it). Esc (the ask rejects; in a terminal session
-// that is a dismissal) rejects the plan.
+// (the ToolUse row draws it). `isDrawn` waits for a text's pictures: the
+// first ask needs them (else the engine's dialog asks); an ask after an edit
+// does not, as the engine's dialog would show the call's text and drop the
+// edit (the person wrote it; a toast says so). Esc (the ask rejects; in a
+// terminal session that is a dismissal) rejects the plan.
 export async function decidePlan(
   $: EngineInterface,
-  o: { plan: string; callPlan: string; file: string; isMac: boolean; isRemote: boolean; onEdited: (plan: string) => void },
+  o: {
+    plan: string; callPlan: string; file: string; isMac: boolean; isRemote: boolean
+    onEdited: (plan: string) => void; isDrawn: (plan: string) => Promise<boolean>
+  },
 ): Promise<PlanOutcome> {
   const code = o.file ? await findCode($) : ''
   const gui = o.file && !code && !o.isMac && !o.isRemote ? await findGuiEditor($) : []
@@ -224,12 +239,19 @@ export async function decidePlan(
   const canEdit = !!argv
   let plan = o.plan
   let isEdited = false
-  for (;;) {
+  for (let isFirst = true; ; isFirst = false) {
+    // No pictures (a failed compile, a page too big over ssh, none in time): the engine's dialog shows the text.
+    if (!(await o.isDrawn(plan))) {
+      if (isFirst) return { kind: 'engine' }
+      try {
+        toast($, PLAN_EDITED_UNDRAWN, { timeoutMs: 8000 })
+      } catch {}
+    }
     const question = isEdited ? PLAN_QUESTION_EDITED : PLAN_QUESTION
     let answer: string
     S.planAsking = question
     try {
-      answer = await uiAsk($, question, { header: PLAN_HEADER, options: planOptions(canEdit) })
+      answer = await ask($, question, { header: PLAN_HEADER, options: planOptions(canEdit) })
     } catch {
       return { kind: 'verdict', verdict: { kind: 'deny', message: PLAN_REJECTED } }
     } finally {
@@ -238,8 +260,15 @@ export async function decidePlan(
     const choice = choiceOf(answer, canEdit)
     if (choice.kind === 'feedback') return { kind: 'feedback', message: feedbackOf(choice.text) }
     if (choice.kind !== 'edit') return { kind: 'verdict', verdict: verdictOf(choice, plan, plan !== o.callPlan)! }
-    await processRun($, argv!, { timeoutMs: EDIT_TIMEOUT_MS }).catch(() => null)
-    const text = await fsRead($, o.file).catch(() => null)
+    const waits = editorWaits(argv!)
+    await exec($, argv!, { timeoutMs: waits ? EDIT_TIMEOUT_MS : OPEN_TIMEOUT_MS }).catch(() => null)
+    // `open` returns at once: the file is read when the person is done (Esc too).
+    while (!waits) {
+      const done = await ask($, PLAN_EDITING, { header: PLAN_HEADER, options: [PLAN_DONE, PLAN_REOPEN] }).catch(() => PLAN_DONE)
+      if (done !== PLAN_REOPEN) break
+      await exec($, argv!, { timeoutMs: OPEN_TIMEOUT_MS }).catch(() => null)
+    }
+    const text = await cat($, o.file).catch(() => null)
     if (typeof text === 'string' && text.trim() && text !== plan) {
       plan = text
       isEdited = text !== o.plan
@@ -256,9 +285,9 @@ export async function decidePlan(
 export async function currentPlan($: EngineInterface, file: string, fallback: string): Promise<string> {
   if (!file) return fallback
   for (let waited = 0; (writesLive.get(file) ?? 0) > 0 && waited < PLAN_WRITE_WAIT_MS; waited += PLAN_WRITE_POLL_MS) {
-    await new Promise<void>(resolve => clockAfter($, PLAN_WRITE_POLL_MS, resolve))
+    await new Promise<void>(resolve => delay($, PLAN_WRITE_POLL_MS, resolve))
   }
-  const text = await fsRead($, file).catch(() => null)
+  const text = await cat($, file).catch(() => null)
   return typeof text === 'string' && text.trim() ? text : fallback
 }
 
@@ -266,10 +295,10 @@ export async function currentPlan($: EngineInterface, file: string, fallback: st
 // /clear and sends the plan as the new context's first prompt. Detached, as
 // `$.command.run` rejects inside a hook the turn waits on.
 export function scheduleClear($: EngineInterface, plan: string, turnId: string) {
-  clockAfter($, CLEAR_DELAY_MS, async () => {
-    if (turnId) await turnAbort($, { turnId }).catch(() => undefined)
-    await commandRun($, { command: 'clear' }).catch(() => undefined)
-    await submit($, { text: `${PLAN_IMPLEMENT}\n\n${plan}`, asUser: true }).catch(() => undefined)
+  delay($, CLEAR_DELAY_MS, async () => {
+    if (turnId) await abort($, { turnId }).catch(() => undefined)
+    await runCmd($, { command: 'clear' }).catch(() => undefined)
+    await send($, { text: `${PLAN_IMPLEMENT}\n\n${plan}`, asUser: true }).catch(() => undefined)
   })
 }
 
